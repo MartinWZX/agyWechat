@@ -12,8 +12,12 @@ import sys
 import time
 from pathlib import Path
 
-# Add project root to sys.path
+# Auto re-exec into project virtualenv if needed
 PROJECT_ROOT = Path(__file__).resolve().parent
+venv_python = PROJECT_ROOT / "venv" / "bin" / "python"
+if venv_python.exists() and sys.executable != str(venv_python):
+    os.execl(str(venv_python), str(venv_python), *sys.argv)
+
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from app.config import get_settings
@@ -22,6 +26,7 @@ from app.ilink_gateway import ILinkAPIClient, ILINK_DEFAULT_BASE_URL
 
 def print_ascii_qr(url_or_code: str, qr_img_path: Path) -> None:
     """Render ASCII QR code in terminal and save PNG image."""
+    print(f"\n[QR_URL]: {url_or_code}\n")
     try:
         import qrcode
         qr = qrcode.QRCode()
@@ -37,10 +42,22 @@ def print_ascii_qr(url_or_code: str, qr_img_path: Path) -> None:
         img.save(str(qr_img_path))
         print(f"🖼️ 二维码图片已保存至: {qr_img_path}")
 
-        # If on WSL, automatically open the image or link in Windows browser
-        wsl_cmd = Path("/mnt/c/Windows/system32/cmd.exe")
-        if wsl_cmd.exists():
-            os.system(f'{wsl_cmd} /c start "" "{url_or_code}" 2>/dev/null &')
+        # Also copy to brain artifact directory if present
+        brain_dir = Path("/home/martin/.gemini/antigravity-cli/brain/dcd16095-ffc4-4075-a401-fa10dd7581cf")
+        if brain_dir.exists():
+            try:
+                shutil.copyfile(str(qr_img_path), str(brain_dir / "wechat_qr.png"))
+            except Exception:
+                pass
+
+        # Also copy to Windows desktop for visual access
+        desktop_dir = Path("/mnt/c/Users/admin/Desktop")
+        if desktop_dir.exists():
+            try:
+                shutil.copyfile(str(qr_img_path), str(desktop_dir / "wechat_qr.png"))
+                print(f"🖥️ 二维码已放置在 Windows 桌面: {desktop_dir / 'wechat_qr.png'}")
+            except Exception:
+                pass
     except Exception as e:
         print(f"⚠️ 终端渲染二维码提示: {e}")
         print(f"🌐 请直接在浏览器中打开二维码链接:\n   {url_or_code}\n")
@@ -72,7 +89,7 @@ def update_env_file(env_path: Path, new_vars: dict) -> None:
     env_path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
 
 
-async def async_login(timeout_seconds: int = 300) -> bool:
+async def async_login(timeout_seconds: int = 600) -> bool:
     """Execute the full QR code login and polling flow."""
     print("==================================================")
     print("🤖 WeChat-AGY Bridge 微信个人号扫码直连")
@@ -118,10 +135,10 @@ async def async_login(timeout_seconds: int = 300) -> bool:
             current_base_url = f"https://{status_resp['redirect_host']}"
         elif status == "expired":
             refresh_count += 1
-            if refresh_count > 3:
+            if refresh_count > 8:
                 print("\n❌ 二维码已超时多次失效，请重新运行本程序。")
                 return False
-            print(f"\n🔄 二维码已过期，正在自动刷新 ({refresh_count}/3)...")
+            print(f"\n🔄 二维码已过期，正在自动刷新 ({refresh_count}/8)...")
             try:
                 qrcode_val, qrcode_url = await ILinkAPIClient.fetch_qr_code(base_url=current_base_url, bot_type="3")
                 print_ascii_qr(qrcode_url or qrcode_val, qr_img_path)
