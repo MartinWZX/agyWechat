@@ -80,6 +80,8 @@ async def test_e2e_full_workflow(e2e_setup):
             assert res.status_code == 200
             status_data = res.json()
             assert status_data["cwd"] == str(workspace)
+            assert "channel" in status_data
+            assert "ilink_active" in status_data
 
             # 2. WeChat GET Webhook verification
             res = await client.get("/webhook?echostr=echostr_val_1234")

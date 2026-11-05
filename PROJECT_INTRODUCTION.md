@@ -1,7 +1,7 @@
 # WeChat-AGY Single-Process Bridge 项目功能与模块架构文档
 
 > **项目名称**：WeChat-AGY Single-Process Bridge (`agyWechat`)  
-> **项目定位**：将本地与服务器端 Google Antigravity CLI（`agy`）搬入微信 ClawBot 聊天界面的生产级 Python 异步桥接服务。
+> **项目定位**：将本地与服务器端 Google Antigravity CLI（`agy`）搬入微信聊天界面的生产级 Python 异步桥接服务，支持**个人号免公网扫码直连**与 **Webhook 回调**双通道。
 
 ---
 
@@ -10,28 +10,37 @@
 在日常开发与运维场景中，开发者经常需要在移动场景（如手机微信）中实时查看项目进度、发起 AI 编程任务、处理突发 Bug 或审批代码变更。Google Antigravity CLI（`agy`）作为一款功能强大的终端智能体编程工具，具备深度的代码理解、自动编辑、工具调用与多步推理能力，但原生仅运行在 POSIX 终端环境中。
 
 **WeChat-AGY Single-Process Bridge** 解决了以下核心痛点：
-1. **移动端终端交互**：利用微信 ClawBot 作为随身交互入口，随时随地向服务器端 AGY 派发编程与运维任务。
+1. **移动端终端交互**：支持微信个人号扫码直连与企业微信/ClawBot，作为随身交互入口，随时随地向服务器端 AGY 派发编程与运维任务。
 2. **终端虚拟化适配**：将复杂的 TUI（终端用户界面）、ANSI 转义序列、动态 Spinner 进度动画及屏幕重绘，净化重构为符合移动端排版的 Markdown 消息。
 3. **单例与资源可控**：严格限制同一时刻单例运行，防止移动端多轮误触引发的多进程资源竞争与代码冲突。
 4. **沙箱与安全隔离**：提供安全目录沙箱、OpenID 访问白名单及标准微信签名防御，保障服务器主机环境安全。
+5. **免公网轻量部署**：引入腾讯官方 iLink Bot 协议长轮询，无需购买公网服务器、免域名备案与内网穿透。
 
 ---
 
 ## 二、 系统总体架构与双态模态
 
-系统设计遵循 **双态状态机（Dual-State Machine）** 范式，通过互斥的 `HOST_MODE`（宿主导航态）与 `AGY_MODE`（AGY 独占态）解耦工作区定位与智能体交互：
+系统设计遵循 **双态状态机（Dual-State Machine）** 范式，通过互斥的 `HOST_MODE`（宿主导航态）与 `AGY_MODE`（AGY 独占态）解耦工作区定位与智能体交互，并提供双协议消息接入：
 
 ```
-                           微信用户消息输入
-                                 │
-                                 ▼
+                    ┌───────────────────────────────┐
+                    │       微信客户端用户交互      │
+                    │  (微信个人号 / ClawBot / 企微) │
+                    └───────┬───────────────┬───────┘
+                            │               │
+                 出站长轮询 /getupdates     │ Webhook POST
+                 主动下发 /sendmessage      │ HTTP 推送
+                            ▼               ▼
+                    ┌───────────────┐ ┌────────────────┐
+                    │ iLink 网关    │ │ Webhook 网关   │
+                    │ (个人号直连)  │ │ (wechat_gateway)│
+                    └───────┬───────┘ └────────┬───────┘
+                            │                  │
+                            └────────┬─────────┘
+                                     │
+                                     ▼
                     ┌─────────────────────────┐
-                    │ WeChatGateway (验签/解包) │
-                    └────────────┬────────────┘
-                                 │
-                                 ▼
-                    ┌─────────────────────────┐
-                    │  UnifiedRouter (鉴权分发) │
+                    │ CommandRouter (鉴权分发)│
                     └────────────┬────────────┘
                                  │
                  ┌───────────────┴───────────────┐
@@ -45,8 +54,8 @@
                  │                               │
     ┌────────────┼────────────┐      ┌───────────┼───────────┐
     ▼            ▼            ▼      ▼           ▼           ▼
-  /pwd         /ls          /cd    /ctrlc      /exit      普通输入/原生指令
-获取路径     浏览目录     切换目录   (SIGINT)   安全终止    100%透传写入PTY
+  /pwd         /ls          /cd    /status     /ctrlc      /exit / 自然语言
+获取路径     浏览目录     切换目录 查看状态   (SIGINT)    安全退出 100%直通PTY
                  │                                           │
                  └───────────────┐   ┌───────────────────────┘
                                  ▼   ▼
@@ -61,10 +70,14 @@
                            │ & Debouncer   │ ◄── 1.5s 防抖 + 审批探测
                            └───────┬───────┘ ◄── Markdown 分片保护 (≤2000字)
                                    │
-                                   ▼
-                           ┌───────────────┐
-                           │ WeChatPusher  │ ──► 主动推送至微信客户端
-                           └───────────────┘
+                    ┌──────────────┴──────────────┐
+                    ▼                             ▼
+           ┌────────────────┐            ┌────────────────┐
+           │  ILinkPusher   │            │  WeChatPusher  │
+           │ (iLink 个人号) │            │ (Webhook 回调) │
+           └────────┬───────┘            └────────┬───────┘
+                    ▼                             ▼
+               个人微信私聊                  微信 API 推送
 ```
 
 ---
@@ -82,11 +95,13 @@ agyWechat/
 │   ├── singleton_agy.py       # PTY 分配、子进程生命周期与单例控制
 │   ├── terminal_cleaner.py    # 终端流净化、防抖、代码块分片与审批探测
 │   ├── command_router.py      # 双态模态命令路由器与沙箱防护
-│   └── wechat_gateway.py      # 微信协议适配、消息防丢队列与主动推送
-├── tests/                     # 39 个自动化测试覆盖套件
+│   ├── wechat_gateway.py      # 微信 Webhook 协议适配、消息防丢队列与主动推送
+│   └── ilink_gateway.py      # 微信个人号腾讯 iLink 协议长轮询与直联网关
+├── tests/                     # 48 个全绿自动化测试套件
 ├── ARCHITECTURE.md            # 系统设计方案与时序规格
 ├── README.md                  # 用户操作与快速开始手册
 ├── run.sh                     # 一键环境初始化与启动脚本
+├── login_wechat.py            # 微信个人号扫码授权登录 CLI 工具
 └── requirements.txt           # 核心依赖清单
 ```
 
@@ -132,7 +147,7 @@ agyWechat/
     - `/exit`、`/quit` 或 `/kill`：安全终止 AGY 进程，触发三层清杀后退回 `HOST_MODE`；
     - **100% 直通透传**：所有非拦截命令（包括所有普通自然语言交互需求）以及 Google AGY 的原生斜杠指令（如 `/clear`, `/diff`, `/effort`, `/skills`, `/mcp`, `/tasks`, `/usage`, `/agents`, `/goal` 等）全量 1:1 写入 PTY Master fd，无损享受完整的 AGY 智能体能力。
 
-### 5. 微信网关与异步通知队列 (`app/wechat_gateway.py`)
+### 5. 微信 Webhook 网关与异步通知队列 (`app/wechat_gateway.py`)
 - **协议兼容**：支持微信 ClawBot、企业微信及各类基于 Webhook 回调的服务。
 - **100ms 极速响应机制**：
   - 微信服务器要求 Webhook 在 5 秒内返回 HTTP 200，否则会触发重试。
@@ -143,9 +158,21 @@ agyWechat/
   - 网络抖动或接口限流时，采用 `min(base_delay * 2^retries, 30)` 算法实施指数退避重试，最大重试 3 次，防止消息丢失。
 - **安全签名校验**：实现标准的 SHA1 字典序签名验证，杜绝未授权伪造请求。
 
-### 6. 应用生命周期与 HTTP 服务 (`app/main.py`)
+### 6. 微信个人号直联网关 (`app/ilink_gateway.py`)
+- **腾讯官方 iLink Bot 协议**：无需公网 IP、免备案域名与端口映射，通过安全的出站 HTTPS 长轮询通信。
+- **`ILinkAPIClient`**：实现二维码获取、扫码状态轮询、`/ilink/bot/getupdates` 长轮询与 `/ilink/bot/sendmessage` 消息下发。
+- **`ContextTokenStore`**：用户级别会话令牌持久化缓存，保障对话上下文连续，且具备会话失效自动重置重试机制。
+- **`ILinkGatewayWorker`**：后台常驻长轮询工作协程，集成用户白名单鉴权、消息解包与路由调度。
+- **`ILinkPusher`**：异步缓冲队列，自动集成 `WeChatSplitter` 保护 Markdown 代码块完整性。
+
+### 7. 微信个人号扫码授权登录 CLI (`login_wechat.py`)
+- **零配置扫码上线**：直接运行即可在终端打印高清晰度 ASCII 二维码，支持手机微信后置摄像头扫码。
+- **图片导出与桌面预览**：同步导出 `wechat_qr.png`，在桌面或沙箱快速预览。
+- **自动凭证持久化**：手机确认登录后自动将 `WEIXIN_TOKEN`、`WEIXIN_ACCOUNT_ID` 与 `WECHAT_CHANNEL=ilink` 写入 `.env`。
+
+### 8. 应用生命周期与 HTTP 服务 (`app/main.py`)
 - **FastAPI 现代化架构**：
-  - 基于 `@asynccontextmanager` 的 `lifespan` 机制，在服务启动时自动初始化后台工作队列与消费循环，服务关闭时自动销毁孤儿进程、释放 PTY 描述符。
+  - 基于 `@asynccontextmanager` 的 `lifespan` 机制，在服务启动时自动初始化后台工作队列与消费循环（Webhook 队列或 iLink 长轮询协程），服务关闭时自动销毁孤儿进程、释放 PTY 描述符。
   - 提供 `/webhook` 微信标准验签与消息接入点。
   - 提供 `/health` 与 `/status` 运维探针接口，便于集成 Docker 健康检查或 Prometheus/K8s 探活。
   - 内置 `/mock/wechat/push` 与 `/mock/wechat/messages` 接口，脱离外网与真实微信凭证即可实现 100% 本地闭环自动化测试。
@@ -154,15 +181,16 @@ agyWechat/
 
 ## 四、 自动化测试体系
 
-项目具有严苛的工程质量控制体系，测试套件位于 `tests/`，包含 39 个全绿测试用例（覆盖单元测试、并发防护与端到端闭环）：
+项目具有严苛的工程质量控制体系，测试套件位于 `tests/`，包含 48 个全绿测试用例（覆盖单元测试、并发防护与端到端闭环）：
 
 | 测试套件 | 测试文件 | 核心校验场景 |
 |---------|---------|-------------|
-| **终端流净化测试** | `test_terminal_cleaner.py` | ANSI 序列清洗、Spinner 动画去重、`pyte` 屏幕 Diff 提取、审批提示符即时探测、长 Markdown 代码块分片闭合保护 |
-| **单例进程测试** | `test_singleton_agy.py` | PTY Master/Slave 分配、子进程输入写回、Ctrl+C 中断传递、自然退出感知、多开并发互斥与三层清杀机制 |
-| **路由与沙箱测试** | `test_command_router.py` | 白名单用户鉴权、非白名单拦截、沙箱越界拦截 (`/cd ../../`)、路径解析、双态命令路由分发 |
-| **微信网关测试** | `test_wechat_gateway.py` | 标准 SHA1 签名校验、JSON/XML 消息体解析、异步接收队列、主动推送接口适配与指数退避重试 |
-| **端到端集成测试** | `test_e2e.py` | 模拟真实微信消息发送、HOST 态切换目录、启动 AGY 独占态、透传输入、流式防抖聚合与主动推送完整生命周期闭环 |
+| **终端流净化测试** | `test_terminal_cleaner.py` | ANSI 序列清洗、Spinner 动画去重、`pyte` 屏幕 Diff 提取、审批提示符即时探测、长 Markdown 代码块分片闭合保护 (12个用例) |
+| **单例进程测试** | `test_singleton_agy.py` | PTY Master/Slave 分配、子进程输入写回、Ctrl+C 中断传递、自然退出感知、多开并发互斥与三层清杀机制 (6个用例) |
+| **路由与沙箱测试** | `test_command_router.py` | 白名单用户鉴权、非白名单拦截、沙箱越界拦截 (`/cd ../../`)、路径解析、双态（HOST/AGY）下 `/status` 与命令路由分发 (11个用例) |
+| **个人号直联测试** | `test_ilink_gateway.py` | 腾讯 iLink 协议头构造、扫码获取与长轮询、消息解包、会话 Token 缓存与后台 Worker 鉴权调度 (8个用例) |
+| **微信网关测试** | `test_wechat_gateway.py` | 标准 SHA1 签名校验、JSON/XML 消息体解析、异步接收队列、主动推送接口适配与指数退避重试 (7个用例) |
+| **端到端集成测试** | `test_e2e.py` | 模拟真实微信消息发送、HOST 态切换目录、启动 AGY 独占态、透传输入、流式防抖聚合与主动推送完整生命周期闭环 (4个用例) |
 
 ---
 
@@ -170,10 +198,14 @@ agyWechat/
 
 | 环境变量名 | 默认值 | 作用说明 |
 |-----------|-------|---------|
+| `WECHAT_CHANNEL` | `webhook` | 通信通道模式：`ilink`（个人号扫码免公网直连）或 `webhook` |
+| `WEIXIN_ACCOUNT_ID` | *(空)* | iLink 机器人账号 ID（由 `./login_wechat.py` 扫码自动写入） |
+| `WEIXIN_TOKEN` | *(空)* | iLink 机器人通信 Token（由 `./login_wechat.py` 扫码自动写入） |
+| `WEIXIN_BASE_URL` | `https://ilinkai.weixin.qq.com` | 腾讯 iLink 官方 API 基础地址 |
 | `WECHAT_TOKEN` | `dev_token_123456` | 微信 Webhook GET 请求签名校验 Token |
 | `WECHAT_PUSH_URL` | `http://127.0.0.1:8000/mock/wechat/push` | 微信主动推送 API 接口地址（生产环境填写微信/企业微信 API） |
 | `WECHAT_BOT_SECRET` | *(空)* | 微信主动推送 API 的 Secret 或 Access Token |
-| `ALLOWED_USERS` | `["*"]` | 允许交互的微信用户 OpenID 白名单，支持逗号或 JSON 数组；`*` 代表全员放行 |
+| `ALLOWED_USERS` | `["*"]` | 允许交互的微信用户 OpenID / iLink UserID 白名单，支持逗号或 JSON 数组；`*` 代表全员放行 |
 | `WORKSPACE_ROOT` | 当前工作目录 | 文件沙箱根路径，`/cd` 命令无法越界跳出此目录 |
 | `AGY_BINARY` | `agy` | Google Antigravity CLI 的可执行文件路径 |
 | `AGY_DEFAULT_ARGS` | `[]` | 启动 AGY 时默认追加的 CLI 参数（如 `--effort high` 等） |
@@ -194,12 +226,14 @@ agyWechat/
 - `/pwd`：输出当前工作目录绝对路径。
 - `/ls [路径]`：浏览指定目录下的文件与子文件夹列表。
 - `/cd <路径>`：安全切换当前目录（受 `WORKSPACE_ROOT` 沙箱保护）。
-- `/status`：查看桥接服务运行指标与状态。
+- `/status`：查看桥接服务整体运行状态、通讯通道模式与 PID。
+- `/help`：查看指令帮助指南。
 - `/agy` 或 `/new`：在当前选定目录拉起全新的 AGY 会话，进入 `AGY_MODE`。
 
 ### 2. AGY 独占态 (`AGY_MODE`)
 - **任意自然语言**：直接输入编程需求、代码修改意见或回答 AGY 的提问，100% 原始透传至 PTY。
 - **原生 AGY 指令**：直接在微信输入 `/diff`、`/clear`、`/effort`、`/skills`、`/mcp`、`/tasks`、`/usage` 等，全部 1:1 直通执行。
+- `/status`：查看当前 AGY 运行态、会话 PID、会话所有者与通道详情。
 - `/ctrlc` 或 `/stop`：向终端下发中断信号（Ctrl+C），停止当前长耗时操作。
 - `/new`：强杀旧实例并在当前目录重新拉起全新会话。
 - `/exit`、`/quit` 或 `/kill`：退出 AGY 会话，安全返回 `HOST_MODE`。

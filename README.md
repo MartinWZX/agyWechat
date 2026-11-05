@@ -1,10 +1,10 @@
 # WeChat-AGY Single-Process Bridge
 
-> 将本地与服务器端 Google Antigravity CLI（`agy`）终端搬入微信 ClawBot 聊天界面的生产级 Python 桥接服务。
+> 将本地与服务器端 Google Antigravity CLI（`agy`）终端搬入微信聊天界面的生产级 Python 桥接服务。支持**个人号免公网免域名扫码直连（基于腾讯官方 iLink Bot 协议）**与**企业微信/ClawBot/公众号 Webhook 回调**双通道。
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.110+-green.svg)](https://fastapi.tiangolo.com/)
-[![Tests](https://img.shields.io/badge/tests-39%20passed-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-48%20passed-brightgreen.svg)]()
 
 ---
 
@@ -70,6 +70,7 @@
 |------|---------|---------|
 | *任意文本输入 / 需求问答* | 100% 透传至 AGY 终端交互 | 写入 PTY master fd |
 | `/clear`, `/diff`, `/effort`, `/skills`, `/mcp`, `/tasks`, `/usage` 等 | Google AGY 原生 Slash 指令，100% 透传至 AGY 执行 | 写入 PTY master fd |
+| `/status` | 查看当前 AGY 运行态、PID、会话归属与通道详情 | 状态面板 |
 | `/ctrlc` 或 `/stop` | 向终端发送 SIGINT (Ctrl+C) 中断当前执行任务 | 写入 `\x03` |
 | `/new` | 强杀当前进程，并在当前目录重启全新 AGY 会话 | `restart()` |
 | `/exit`、`/quit` 或 `/kill` | 终止 AGY 会话，三层清杀后安全回到 `HOST_MODE` | `terminate()` |
@@ -85,21 +86,34 @@
 - Python 3.10+
 - Google Antigravity CLI (`agy`) 已安装并配置在 `$PATH` 或 `~/.local/bin/agy`
 
-### 4.2 配置环境变量
+### 4.2 接入方式选择
+
+#### 方式 A：微信个人号免公网扫码直连（推荐）
+无需公网 IP、免域名备案与端口映射，通过腾讯 iLink Bot 协议出站直连：
+```bash
+./login_wechat.py
+```
+控制台将输出 ASCII 二维码并生成 `wechat_qr.png`。使用手机微信扫描并在手机端确认登录，凭证（`WEIXIN_TOKEN` 与 `WEIXIN_ACCOUNT_ID`）将自动持久化至 `.env`。
+
+#### 方式 B：Webhook 模式（企业微信 / 公众号 / ClawBot）
 从模板创建配置文件：
 ```bash
 cp .env.example .env
 ```
 根据实际情况修改 `.env`：
 ```ini
-# 微信 Webhook 校验 Token
-WECHAT_TOKEN=your_wechat_webhook_token_here
+# 通信通道配置 (ilink 个人号直连 或 webhook)
+WECHAT_CHANNEL=ilink
+WEIXIN_ACCOUNT_ID=your_bot_id@im.bot
+WEIXIN_TOKEN=your_ilink_token
+WEIXIN_BASE_URL=https://ilinkai.weixin.qq.com
 
-# 微信主动推送 API 地址 (如微信 ClawBot 发送消息接口)
+# 微信 Webhook 校验 Token (Webhook 模式)
+WECHAT_TOKEN=your_wechat_webhook_token_here
 WECHAT_PUSH_URL=https://api.weixin.qq.com/cgi-bin/message/custom/send
 WECHAT_BOT_SECRET=your_wechat_bot_secret_here
 
-# 允许访问的微信用户 OpenID 白名单 (* 表示全部允许)
+# 允许访问的微信用户 OpenID / iLink UserID 白名单 (* 表示全部允许)
 ALLOWED_USERS=["user_openid_1", "user_openid_2"]
 
 # 文件沙箱根目录 (/cd 无法越界此目录)
@@ -144,17 +158,18 @@ SERVICE_PORT=8000
 
 ## 6. 自动化测试
 
-项目具备全方位的单元测试和端到端集成测试，涵盖终端 ANSI 净化、分片保护、进程单例、命令路由与 Webhook 闭环：
+项目具备全方位的单元测试和端到端集成测试，涵盖终端 ANSI 净化、分片保护、进程单例、命令路由、双网关协议与闭环交付：
 
 ```bash
-# 运行全部 39 个测试用例
+# 运行全部 48 个自动化测试用例
 ./venv/bin/pytest -v
 ```
 
 测试模块说明：
 - `tests/test_terminal_cleaner.py`：测试 ANSI 控制符清洗、Spinner 去重、提示符检测、Markdown 代码块分片。
 - `tests/test_singleton_agy.py`：测试 PTY 分配、输入透传、Ctrl+C、自然退出感知、进程清杀与重启。
-- `tests/test_command_router.py`：测试白名单鉴权、沙箱安全越界拦截、双态路由分发。
+- `tests/test_command_router.py`：测试白名单鉴权、沙箱安全越界拦截、双态（HOST/AGY）下 `/status` 与命令路由分发。
+- `tests/test_ilink_gateway.py`：测试腾讯 iLink Bot 协议鉴权头构造、扫码状态长轮询、消息解包与上下文 Token 缓存维护。
 - `tests/test_wechat_gateway.py`：测试微信标准签名校验、多种 Payload 解析、推送队列与指数重试。
 - `tests/test_e2e.py`：端到端模拟微信 Webhook 发送与消息接收的完整生命周期交互。
 
