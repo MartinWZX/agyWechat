@@ -1,7 +1,7 @@
 # WeChat-AGY Single-Process Bridge 项目功能与模块架构文档
 
 > **项目名称**：WeChat-AGY Single-Process Bridge (`agyWechat`)  
-> **项目定位**：将本地与服务器端 Google Antigravity CLI（`agy`）搬入微信聊天界面的生产级 Python 异步桥接服务。
+> **项目定位**：将本地与服务器端 Google Antigravity CLI（`agy`）搬入微信 ClawBot 聊天界面的生产级 Python 异步桥接服务。
 
 ---
 
@@ -10,7 +10,7 @@
 在日常开发与运维场景中，开发者经常需要在移动场景（如手机微信）中实时查看项目进度、发起 AI 编程任务、处理突发 Bug 或审批代码变更。Google Antigravity CLI（`agy`）作为一款功能强大的终端智能体编程工具，具备深度的代码理解、自动编辑、工具调用与多步推理能力，但原生仅运行在 POSIX 终端环境中。
 
 **WeChat-AGY Single-Process Bridge** 解决了以下核心痛点：
-1. **移动端终端交互**：利用微信作为随身交互入口，随时随地向服务器端 AGY 派发编程与运维任务。
+1. **移动端终端交互**：利用微信 ClawBot 作为随身交互入口，随时随地向服务器端 AGY 派发编程与运维任务。
 2. **终端虚拟化适配**：将复杂的 TUI（终端用户界面）、ANSI 转义序列、动态 Spinner 进度动画及屏幕重绘，净化重构为符合移动端排版的 Markdown 消息。
 3. **单例与资源可控**：严格限制同一时刻单例运行，防止移动端多轮误触引发的多进程资源竞争与代码冲突。
 4. **沙箱与安全隔离**：提供安全目录沙箱、OpenID 访问白名单及标准微信签名防御，保障服务器主机环境安全。
@@ -133,7 +133,7 @@ agyWechat/
     - **100% 直通透传**：所有非拦截命令（包括所有普通自然语言交互需求）以及 Google AGY 的原生斜杠指令（如 `/clear`, `/diff`, `/effort`, `/skills`, `/mcp`, `/tasks`, `/usage`, `/agents`, `/goal` 等）全量 1:1 写入 PTY Master fd，无损享受完整的 AGY 智能体能力。
 
 ### 5. 微信网关与异步通知队列 (`app/wechat_gateway.py`)
-- **协议兼容**：支持微信公众号、微信企业号（企业微信）及各类基于 Webhook 回调的服务。
+- **协议兼容**：支持微信 ClawBot、企业微信及各类基于 Webhook 回调的服务。
 - **100ms 极速响应机制**：
   - 微信服务器要求 Webhook 在 5 秒内返回 HTTP 200，否则会触发重试。
   - 网关在收到用户消息后仅执行格式提取，并在毫秒级完成消息入队并返回 HTTP 200 响应。

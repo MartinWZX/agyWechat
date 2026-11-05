@@ -1,6 +1,6 @@
 # WeChat-AGY Single-Process Bridge
 
-> 将本地 Google Antigravity CLI（`agy`）终端搬入微信 Cloud Bot 聊天界面的生产级 Python 桥接服务。
+> 将本地与服务器端 Google Antigravity CLI（`agy`）终端搬入微信 ClawBot 聊天界面的生产级 Python 桥接服务。
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.110+-green.svg)](https://fastapi.tiangolo.com/)
@@ -95,7 +95,7 @@ cp .env.example .env
 # 微信 Webhook 校验 Token
 WECHAT_TOKEN=your_wechat_webhook_token_here
 
-# 微信主动推送 API 地址 (如微信 Cloud Bot 发送消息接口)
+# 微信主动推送 API 地址 (如微信 ClawBot 发送消息接口)
 WECHAT_PUSH_URL=https://api.weixin.qq.com/cgi-bin/message/custom/send
 WECHAT_BOT_SECRET=your_wechat_bot_secret_here
 
@@ -103,10 +103,10 @@ WECHAT_BOT_SECRET=your_wechat_bot_secret_here
 ALLOWED_USERS=["user_openid_1", "user_openid_2"]
 
 # 文件沙箱根目录 (/cd 无法越界此目录)
-WORKSPACE_ROOT=/home/martin/AI/agyWechat
+WORKSPACE_ROOT=/path/to/your/workspace
 
-# agy 可执行文件路径
-AGY_BINARY=/home/martin/.local/bin/agy
+# agy 可执行文件路径（可配置为系统 PATH 中的 agy 或指定绝对路径）
+AGY_BINARY=agy
 
 # PTY 虚拟终端规格与防抖配置
 PTY_COLS=120
@@ -172,12 +172,12 @@ After=network.target
 
 [Service]
 Type=simple
-User=martin
-WorkingDirectory=/home/martin/AI/agyWechat
-ExecStart=/home/martin/AI/agyWechat/venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000 --lifespan on
+User=your_username
+WorkingDirectory=/path/to/agyWechat
+ExecStart=/path/to/agyWechat/venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000 --lifespan on
 Restart=always
 RestartSec=3
-EnvironmentFile=/home/martin/AI/agyWechat/.env
+EnvironmentFile=/path/to/agyWechat/.env
 
 [Install]
 WantedBy=multi-user.target
