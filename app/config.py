@@ -3,7 +3,7 @@
 import json
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, List, Union
+from typing import Any, List, Optional, Union
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -16,6 +16,10 @@ class Settings(BaseSettings):
     )
 
     # WeChat credentials & configuration
+    WECHAT_CHANNEL: str = Field(
+        default="webhook",
+        description="WeChat channel mode: 'webhook' (default) or 'ilink' (direct personal WeChat)",
+    )
     WECHAT_TOKEN: str = Field(default="dev_token_123456", description="WeChat Webhook verification token")
     WECHAT_PUSH_URL: str = Field(
         default="http://127.0.0.1:8000/mock/wechat/push",
@@ -25,6 +29,20 @@ class Settings(BaseSettings):
     ALLOWED_USERS: List[str] = Field(
         default_factory=lambda: ["*"],
         description="List of allowed WeChat OpenIDs (* allows any user)",
+    )
+
+    # Tencent iLink Bot (Personal WeChat direct login) configuration
+    WEIXIN_ACCOUNT_ID: Optional[str] = Field(
+        default=None,
+        description="Tencent iLink Bot account identifier (e.g. xxx@im.bot)",
+    )
+    WEIXIN_TOKEN: Optional[str] = Field(
+        default=None,
+        description="Tencent iLink Bot authentication token",
+    )
+    WEIXIN_BASE_URL: str = Field(
+        default="https://ilinkai.weixin.qq.com",
+        description="Tencent iLink API endpoint base URL",
     )
 
     # Sandbox & executable

@@ -51,11 +51,36 @@ async def lifespan(app: FastAPI):
     app.state.router = router
     gateway.start(router=router)
 
+    # 4. Initialize iLink Bot Worker if WEIXIN_TOKEN is configured
+    ilink_worker = None
+    if settings.WEIXIN_TOKEN:
+        from app.ilink_gateway import ILinkGatewayWorker
+        ilink_worker = getattr(app.state, "ilink_worker", None)
+        if ilink_worker is None:
+            ilink_worker = ILinkGatewayWorker(settings=settings, router=router)
+            app.state.ilink_worker = ilink_worker
+
+        orig_callback = gateway.on_terminal_output
+        async def combined_output(text: str) -> None:
+            await orig_callback(text)
+            if ilink_worker:
+                await ilink_worker.on_terminal_output(text)
+
+        manager.push_callback = combined_output
+        ilink_worker.start()
+        logger.info("Direct personal WeChat (iLink Bot) connection activated!")
+
     logger.info("WeChat-AGY Bridge started successfully. Mode: HOST_MODE")
     yield
 
     # Shutdown
     logger.info("Shutting down WeChat-AGY Bridge...")
+    if ilink_worker:
+        try:
+            await ilink_worker.stop()
+        except Exception as e:
+            logger.error(f"Error stopping ilink worker on shutdown: {e}")
+
     try:
         await manager.terminate()
     except Exception as e:
