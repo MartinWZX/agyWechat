@@ -79,7 +79,7 @@ def create_app(
     app = FastAPI(
         title="WeChat-AGY Single-Process Bridge",
         version=__version__,
-        description="Bridge between WeChat Cloud Bot and Google Antigravity CLI",
+        description="Bridge between WeChat ClawBot and Google Antigravity CLI",
         lifespan=lifespan,
     )
 

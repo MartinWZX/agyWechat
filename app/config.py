@@ -19,7 +19,7 @@ class Settings(BaseSettings):
     WECHAT_TOKEN: str = Field(default="dev_token_123456", description="WeChat Webhook verification token")
     WECHAT_PUSH_URL: str = Field(
         default="http://127.0.0.1:8000/mock/wechat/push",
-        description="WeChat Cloud Bot active push API endpoint",
+        description="WeChat ClawBot active push API endpoint",
     )
     WECHAT_BOT_SECRET: str = Field(default="", description="WeChat Push API authentication secret")
     ALLOWED_USERS: List[str] = Field(

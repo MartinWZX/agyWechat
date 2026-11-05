@@ -1,4 +1,4 @@
-"""WeChat Cloud Bot Webhook gateway and asynchronous push queue."""
+"""WeChat ClawBot Webhook gateway and asynchronous push queue."""
 
 import asyncio
 import hashlib
@@ -79,7 +79,7 @@ class WebhookValidator:
 
 
 class WeChatPusher:
-    """Sends active push messages to WeChat Cloud Bot API with retry support."""
+    """Sends active push messages to WeChat ClawBot API with retry support."""
 
     def __init__(self, settings: Settings, client: Optional[httpx.AsyncClient] = None):
         self.settings = settings

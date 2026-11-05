@@ -6,7 +6,7 @@
 
 ## 1. 项目概述
 
-**WeChat-AGY Bridge** 是一套将本地 Google Antigravity CLI（`agy`）终端会话搬入微信 Cloud Bot 聊天界面的生产级 Python 后端服务。用户可通过微信消息完整控制唯一的 `agy` 进程，实现远程 AI 编程协作。
+**WeChat-AGY Bridge** 是一套将本地/服务器端 Google Antigravity CLI（`agy`）终端会话搬入微信 ClawBot 聊天界面的生产级 Python 后端服务。用户可通过微信消息完整控制唯一的 `agy` 进程，实现远程 AI 编程协作。
 
 ### 1.1 核心设计哲学
 
@@ -24,7 +24,7 @@
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                    微信 Cloud Bot 用户端                      │
+│                     微信 ClawBot 用户端                      │
 │            （发送消息 / 接收推送 via WeChat API）              │
 └─────────────────────┬───────────────────┬───────────────────┘
                       │ Webhook POST       │ 主动推送 HTTP
@@ -74,7 +74,7 @@
 └─────────────────────────────────────────│───────────────────┘
                                           │ HTTP 主动推送
                                           ▼
-                               微信 Cloud Bot 消息发送 API
+                                微信 ClawBot 消息发送 API
 ```
 
 ---
@@ -273,7 +273,7 @@ asyncio.create_task(_monitor_process_exit())
 
 ### 4.5 `app/wechat_gateway.py` — 微信消息网关
 
-**职责**：处理微信 Cloud Bot 的 Webhook 接收与主动消息推送。
+**职责**：处理微信 ClawBot 的 Webhook 接收与主动消息推送。
 
 **子模块**：
 
