@@ -122,9 +122,10 @@ async def test_natural_exit(tmp_path):
     manager = SingletonAGYManager(settings=settings, push_callback=on_push)
     await manager.spawn()
 
-    # Wait for process exit detection
-    await asyncio.sleep(0.4)
+    # Wait for process exit detection and reader flush
+    await asyncio.sleep(0.5)
 
     assert manager.state == SystemState.HOST_MODE
     assert not manager.is_running()
+    assert any("bye" in msg for msg in pushed)
     assert any("HOST_MODE" in msg for msg in pushed)

@@ -137,3 +137,20 @@ async def test_debounce_buffer_overflow_flush():
 
     await buffer.feed("This message is longer than twenty characters!")
     assert len(flushed_items) >= 1
+
+
+def test_ansi_cleaner_resolve_carriage_returns():
+    raw = "Progress 10%\rProgress 50%\rProgress 100%"
+    resolved = ANSICleaner.resolve_carriage_returns(raw)
+    assert resolved == "Progress 100%"
+
+
+def test_ansi_cleaner_dedup_consecutive_lines():
+    repeated = "Generating...\n\nGenerating...\n\nGenerating...\nDone!"
+    deduped = ANSICleaner.dedup_consecutive_lines(repeated)
+    assert deduped == "Generating...\n\nDone!"
+
+    # Code block preservation test
+    code_text = "```python\nprint(1)\nprint(1)\n```"
+    code_deduped = ANSICleaner.dedup_consecutive_lines(code_text)
+    assert "print(1)\nprint(1)" in code_deduped

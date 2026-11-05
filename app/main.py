@@ -173,24 +173,37 @@ def create_app(
             if not valid:
                 raise HTTPException(status_code=403, detail="Invalid webhook signature")
 
-        # Parse message payload
+        # Parse message payload (supports JSON and XML)
+        user_id = ""
+        content = ""
         try:
             data = await request.json()
             payload = WeChatPayload(**data)
             user_id = payload.get_user_id()
             content = payload.get_content()
         except Exception:
-            # Fallback: raw text body
-            user_id = gw.active_user
-            content = body_bytes.decode("utf-8", errors="replace")
+            # Fallback 1: Try XML parsing (standard WeChat Official Account / WeCom format)
+            try:
+                import xml.etree.ElementTree as ET
+                root = ET.fromstring(body_bytes.decode("utf-8", errors="replace"))
+                user_id = root.findtext("FromUserName") or root.findtext("from_user") or ""
+                content = root.findtext("Content") or root.findtext("content") or ""
+            except Exception:
+                # Fallback 2: raw text body
+                user_id = ""
+                content = body_bytes.decode("utf-8", errors="replace").strip()
 
         if not user_id:
-            user_id = gw.active_user
+            user_id = "anonymous"
 
         if content:
             await gw.enqueue_incoming(user_id=user_id, content=content)
 
-        # Fast 100ms ACK response
+        # Fast 100ms ACK response (XML requests get "success" per WeChat Official Account spec)
+        content_type = request.headers.get("content-type", "").lower()
+        if "xml" in content_type or body_bytes.strip().startswith(b"<xml"):
+            return PlainTextResponse("success")
+
         return {"errcode": 0, "errmsg": "ok"}
 
     @app.post("/mock/wechat/push")

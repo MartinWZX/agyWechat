@@ -68,6 +68,55 @@ class ANSICleaner:
             cleaned_lines.append(cleaned_line)
         return "\n".join(cleaned_lines)
 
+    @staticmethod
+    def resolve_carriage_returns(text: str) -> str:
+        """Resolve standalone carriage returns (\\r without \\n) as in-place line overwrites."""
+        if not text:
+            return ""
+        text = text.replace("\r\n", "\n")
+        lines = text.split("\n")
+        resolved = []
+        for line in lines:
+            if "\r" in line:
+                parts = [p for p in line.split("\r") if p.strip()]
+                resolved.append(parts[-1] if parts else "")
+            else:
+                resolved.append(line)
+        return "\n".join(resolved)
+
+    @staticmethod
+    def dedup_consecutive_lines(text: str) -> str:
+        """Collapse repeated spinner / progress lines while preserving markdown code blocks."""
+        if not text:
+            return ""
+        lines = text.split("\n")
+        deduped: List[str] = []
+        last_non_empty: Optional[str] = None
+        in_code_block = False
+
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith("```"):
+                in_code_block = not in_code_block
+                deduped.append(line)
+                last_non_empty = None
+                continue
+
+            if in_code_block:
+                deduped.append(line)
+                continue
+
+            if stripped:
+                if last_non_empty and stripped.lower() == last_non_empty.lower():
+                    continue
+                last_non_empty = stripped
+                deduped.append(line)
+            else:
+                if deduped and deduped[-1].strip():
+                    deduped.append("")
+
+        return "\n".join(deduped).strip()
+
     def feed_to_screen(self, data: str) -> None:
         """Feed data into pyte virtual screen."""
         self.stream.feed(data)
@@ -86,8 +135,10 @@ class ANSICleaner:
         return lines
 
     def clean_text(self, text: str) -> str:
-        """Full pipeline: strip ANSI and remove spinner artifacts."""
-        return self.filter_spinners(self.strip_ansi(text))
+        """Full pipeline: strip ANSI, resolve carriage returns, and remove spinner artifacts."""
+        stripped = self.strip_ansi(text)
+        resolved = self.resolve_carriage_returns(stripped)
+        return self.filter_spinners(resolved)
 
 
 class IncrementalExtractor:
@@ -246,11 +297,13 @@ class DebounceBuffer:
         if not raw_data:
             return
 
-        cleaned = self.cleaner.clean_text(raw_data)
-        if not cleaned:
-            return
-
         async with self._lock:
+            try:
+                self.cleaner.feed_to_screen(raw_data)
+            except Exception:
+                pass
+
+            cleaned = self.cleaner.clean_text(raw_data)
             self._buffer += cleaned
             is_prompt = ApprovalDetector.is_approval_prompt(self._buffer)
             is_overflow = len(self._buffer) >= self.max_chunk_chars
@@ -282,11 +335,22 @@ class DebounceBuffer:
 
         text_to_send: str = ""
         async with self._lock:
-            if not self._buffer:
-                return
-            text_to_send = self._buffer
+            # 1. Try pyte virtual screen incremental extraction to absorb TUI rewrites
+            screen_lines = self.cleaner.get_screen_lines()
+            diff = self.extractor.extract_diff(screen_lines)
+            if diff:
+                text_to_send = diff
+            elif self._buffer:
+                # 2. Fall back to buffer if screen extraction had no diff
+                text_to_send = self._buffer
             self._buffer = ""
 
+        if not text_to_send:
+            return
+
+        # Strip remaining artifacts and collapse duplicate progress lines
+        text_to_send = self.cleaner.clean_text(text_to_send)
+        text_to_send = ANSICleaner.dedup_consecutive_lines(text_to_send)
         if not text_to_send.strip():
             return
 

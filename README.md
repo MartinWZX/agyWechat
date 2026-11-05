@@ -4,7 +4,7 @@
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.110+-green.svg)](https://fastapi.tiangolo.com/)
-[![Tests](https://img.shields.io/badge/tests-29%20passed-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-39%20passed-brightgreen.svg)]()
 
 ---
 
@@ -59,18 +59,21 @@
 | `/pwd` | 显示当前工作目录 | `/pwd` |
 | `/ls [路径]` | 查看指定或当前目录文件列表（带图标及大小） | `/ls` 或 `/ls src` |
 | `/cd <路径>` | 切换工作目录（严格受 `WORKSPACE_ROOT` 沙箱保护） | `/cd project-a` |
+| `/status` | 查看系统运行状态、沙箱与会话就绪态 | `/status` |
 | `/help` | 查看完整帮助手册 | `/help` |
-| `/agy` 或 `/new` | 在当前工作目录启动 AGY 进程，进入 `AGY_MODE` | `/agy` |
+| `/agy` 或 `/new` | 在当前工作目录启动全局唯一 AGY 进程，进入 `AGY_MODE` | `/agy` |
 
 ### 3.2 AGY 独占态 (`AGY_MODE`)
-一旦进入 `AGY_MODE`，普通命令直通 AGY，特殊控制命令被拦截：
+一旦进入 `AGY_MODE`，普通命令与 AGY 原生指令直通 AGY，特殊控制命令被拦截：
 
 | 命令 | 功能说明 | 实现机制 |
 |------|---------|---------|
-| *任意文本输入* | 100% 透传至 AGY 终端交互 | 写入 PTY master fd |
+| *任意文本输入 / 需求问答* | 100% 透传至 AGY 终端交互 | 写入 PTY master fd |
+| `/clear`, `/diff`, `/effort`, `/skills`, `/mcp`, `/tasks`, `/usage` 等 | Google AGY 原生 Slash 指令，100% 透传至 AGY 执行 | 写入 PTY master fd |
 | `/ctrlc` 或 `/stop` | 向终端发送 SIGINT (Ctrl+C) 中断当前执行任务 | 写入 `\x03` |
 | `/new` | 强杀当前进程，并在当前目录重启全新 AGY 会话 | `restart()` |
-| `/exit` 或 `/kill` | 终止 AGY 会话，三层清杀后安全回到 `HOST_MODE` | `terminate()` |
+| `/exit`、`/quit` 或 `/kill` | 终止 AGY 会话，三层清杀后安全回到 `HOST_MODE` | `terminate()` |
+| `/agy` | 提示当前已处于单例独占态，杜绝多开 | 状态防呆提示 |
 | `/pwd`, `/ls`, `/cd` | 提示用户当前处于独占态，需先 `/exit` | 防误触提示 |
 
 ---
@@ -144,7 +147,7 @@ SERVICE_PORT=8000
 项目具备全方位的单元测试和端到端集成测试，涵盖终端 ANSI 净化、分片保护、进程单例、命令路由与 Webhook 闭环：
 
 ```bash
-# 运行全部 29 个测试用例
+# 运行全部 39 个测试用例
 ./venv/bin/pytest -v
 ```
 

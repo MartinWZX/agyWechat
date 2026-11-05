@@ -93,8 +93,17 @@ class WeChatPusher:
             return True
 
         headers = {"Content-Type": "application/json"}
+        push_url = self.settings.WECHAT_PUSH_URL
+
         if self.settings.WECHAT_BOT_SECRET:
             headers["Authorization"] = f"Bearer {self.settings.WECHAT_BOT_SECRET}"
+            # Official WeChat / WeCom compatibility: append token/key if not already present
+            if "api.weixin.qq.com" in push_url and "access_token=" not in push_url:
+                delim = "&" if "?" in push_url else "?"
+                push_url = f"{push_url}{delim}access_token={self.settings.WECHAT_BOT_SECRET}"
+            elif "qyapi.weixin.qq.com" in push_url and "key=" not in push_url:
+                delim = "&" if "?" in push_url else "?"
+                push_url = f"{push_url}{delim}key={self.settings.WECHAT_BOT_SECRET}"
 
         payload = {
             "touser": user_id,
@@ -112,7 +121,7 @@ class WeChatPusher:
 
         try:
             resp = await client.post(
-                self.settings.WECHAT_PUSH_URL,
+                push_url,
                 json=payload,
                 headers=headers,
             )
@@ -178,8 +187,12 @@ class PushQueue:
                         logger.warning(
                             f"Push failed for {msg.user_id}, retrying ({msg.retry_count}/{self.max_retries}) in {backoff}s: {e}"
                         )
-                        await asyncio.sleep(backoff)
-                        await self.queue.put(msg)
+                        async def _retry_after_delay(retry_msg: PushMessage, delay: float):
+                            await asyncio.sleep(delay)
+                            if self._running:
+                                await self.queue.put(retry_msg)
+
+                        asyncio.create_task(_retry_after_delay(msg, backoff))
                     else:
                         logger.error(f"Push to {msg.user_id} dropped after {self.max_retries} retries: {e}")
                 finally:
@@ -234,18 +247,29 @@ class WeChatGateway:
             return self.settings.ALLOWED_USERS[0]
         return "default_user"
 
+    def is_authorized(self, user_id: str) -> bool:
+        """Check if user_id is in ALLOWED_USERS whitelist."""
+        if "*" in self.settings.ALLOWED_USERS:
+            return True
+        return user_id in self.settings.ALLOWED_USERS
+
     def set_active_user(self, user_id: str) -> None:
         """Record last active user who sent a command."""
         self._last_active_user = user_id
 
     async def enqueue_incoming(self, user_id: str, content: str) -> None:
-        """Enqueue incoming user message for fast 100ms ACK."""
-        self.set_active_user(user_id)
+        """Enqueue incoming user message for fast 100ms ACK (only update active_user if authorized)."""
+        if self.is_authorized(user_id):
+            self.set_active_user(user_id)
         await self.incoming_queue.put((user_id, content))
 
     async def on_terminal_output(self, text: str) -> None:
         """Callback invoked by SingletonAGYManager when PTY emits cleaned output."""
-        target_user = self.active_user
+        target_user = None
+        if self.router and hasattr(self.router, "manager") and self.router.manager:
+            target_user = self.router.manager.session_owner
+        if not target_user:
+            target_user = self.active_user
         if target_user:
             await self.push_queue.push(user_id=target_user, content=text)
 

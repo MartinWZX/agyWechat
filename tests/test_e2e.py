@@ -218,3 +218,54 @@ async def test_e2e_unauthorized_user(e2e_setup):
             assert "访问被拒绝" in last_body
 
     await mock_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_e2e_xml_payload(e2e_setup):
+    app = e2e_setup["app"]
+    pushed_requests: list[httpx.Request] = e2e_setup["pushed_requests"]
+    mock_client: httpx.AsyncClient = e2e_setup["mock_client"]
+
+    xml_body = """<xml>
+        <ToUserName><![CDATA[server_bot]]></ToUserName>
+        <FromUserName><![CDATA[test_user]]></FromUserName>
+        <MsgType><![CDATA[text]]></MsgType>
+        <Content><![CDATA[/pwd]]></Content>
+    </xml>"""
+
+    transport = httpx.ASGITransport(app=app)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            res = await client.post("/webhook", content=xml_body, headers={"Content-Type": "application/xml"})
+            assert res.status_code == 200
+            assert res.text == "success"
+
+            await asyncio.sleep(0.3)
+            assert len(pushed_requests) >= 1
+            last_body = pushed_requests[-1].content.decode("utf-8")
+            assert "当前工作目录" in last_body
+
+    await mock_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_e2e_anonymous_user_blocked(e2e_setup):
+    app = e2e_setup["app"]
+    pushed_requests: list[httpx.Request] = e2e_setup["pushed_requests"]
+    mock_client: httpx.AsyncClient = e2e_setup["mock_client"]
+
+    transport = httpx.ASGITransport(app=app)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            # Send raw text body with no identifiable user_id
+            res = await client.post("/webhook", content="/pwd", headers={"Content-Type": "text/plain"})
+            assert res.status_code == 200
+
+            await asyncio.sleep(0.3)
+            assert len(pushed_requests) >= 1
+            last_body = pushed_requests[-1].content.decode("utf-8")
+            # Must be denied because "anonymous" is not in ALLOWED_USERS
+            assert "访问被拒绝" in last_body
+            assert "anonymous" in last_body
+
+    await mock_client.aclose()
