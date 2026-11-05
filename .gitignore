@@ -41,3 +41,7 @@ htmlcov/
 # Logs
 *.log
 logs/
+
+# WeChat iLink tokens & temporary QR
+.context_tokens.json
+wechat_qr.png
