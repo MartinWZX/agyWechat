@@ -13,15 +13,29 @@ HELP_TEXT = """🤖 *WeChat-AGY Bridge 帮助手册*
 • `/pwd` - 查看当前工作目录
 • `/ls [路径]` - 查看目录文件清单
 • `/cd <路径>` - 切换工作目录 (沙箱限制内)
+• `/status` - 查看服务与会话状态
 • `/agy` 或 `/new` - 启动 AGY 会话，进入独占态
 • `/help` - 显示本帮助手册
 
 【AGY 独占态 (AGY_MODE)】
-• *直接输入任意文本* - 100% 透传至 AGY 终端交互
+• *直接输入任意文本* - 100% 透传至 AGY 终端交互（代码编写、需求问答、调试等）
 • `/ctrlc` 或 `/stop` - 中断当前任务 (SIGINT)
 • `/new` - 终止旧进程，重启全新 AGY 会话
-• `/exit` 或 `/kill` - 退出会话，安全返回 HOST_MODE
+• `/exit` 或 `/quit` 或 `/kill` - 退出会话，安全返回 HOST_MODE
 • `/help` - 显示本帮助手册
+
+【Google AGY 智能体原生命令 (独占态下 100% 直通调用)】
+• `/clear` - 清空当前上下文并开启新轮次
+• `/diff` - 查看代码修改与差异
+• `/effort` - 设置深度思考等级 (low/medium/high/xhigh/max)
+• `/skills` - 列出并查看可用的技能扩展
+• `/mcp` - 管理与查看 MCP 服务配置
+• `/tasks` - 查看后台运行的任务列表
+• `/usage` (或 `/quota`) - 查看模型配额与 Token 消耗
+• `/agents` - 列出可用的定制智能体
+• `/artifact` - 查看并审阅生成的工件
+• `/btw` - 在不打断当前任务的情况下侧面追问
+• 智能体技能指令（如 `/goal`, `/plan`, `/browser`, `/teamwork` 等均原生支持）
 """
 
 
@@ -32,7 +46,7 @@ class HostModeRouter:
         self.manager = manager
         self.settings = settings
 
-    async def handle(self, message: str) -> str:
+    async def handle(self, message: str, user_id: Optional[str] = None) -> str:
         tokens = message.strip().split()
         if not tokens:
             return "请输入有效命令。输入 /help 查看帮助。"
@@ -46,6 +60,17 @@ class HostModeRouter:
         if cmd == "/help":
             return HELP_TEXT
 
+        if cmd == "/status":
+            agy_status = f"运行中 (PID: {self.manager.pid})" if self.manager.is_running() else "未运行（就绪）"
+            return (
+                f"📊 *WeChat-AGY 系统运行状态*\n"
+                f"• 当前状态：`HOST_MODE`（宿主导航态）\n"
+                f"• 工作目录：`{self.manager.GLOBAL_CWD}`\n"
+                f"• AGY 进程：{agy_status}\n"
+                f"• 沙箱根目录：`{self.settings.WORKSPACE_ROOT}`\n\n"
+                f"💡 输入 `/agy` 即可启动唯一 AI 编程会话。"
+            )
+
         if cmd == "/ls":
             return self._handle_ls(args)
 
@@ -54,7 +79,7 @@ class HostModeRouter:
 
         if cmd in ("/agy", "/new"):
             try:
-                await self.manager.spawn(cwd=self.manager.GLOBAL_CWD)
+                await self.manager.spawn(cwd=self.manager.GLOBAL_CWD, extra_args=args or None, user_id=user_id)
                 return (
                     f"🚀 *AGY 会话已启动* (PID: {self.manager.pid})\n"
                     f"📂 工作目录：`{self.manager.GLOBAL_CWD}`\n\n"
@@ -73,7 +98,8 @@ class HostModeRouter:
     def _handle_ls(self, args: list[str]) -> str:
         target_dir = self.manager.GLOBAL_CWD
         if args:
-            path_arg = Path(args[0])
+            path_str = " ".join(args).strip("\"'")
+            path_arg = Path(path_str)
             target_dir = (self.manager.GLOBAL_CWD / path_arg).resolve() if not path_arg.is_absolute() else path_arg.resolve()
 
         # Sandbox boundary validation
@@ -116,7 +142,8 @@ class HostModeRouter:
             self.manager.GLOBAL_CWD = self.settings.WORKSPACE_ROOT
             return f"✅ 已返回沙箱根目录：`{self.manager.GLOBAL_CWD}`"
 
-        path_arg = Path(args[0])
+        path_str = " ".join(args).strip("\"'")
+        path_arg = Path(path_str)
         target_dir = (self.manager.GLOBAL_CWD / path_arg).resolve() if not path_arg.is_absolute() else path_arg.resolve()
 
         # Sandbox validation
@@ -148,15 +175,23 @@ class AgyModeRouter:
     def __init__(self, manager: SingletonAGYManager):
         self.manager = manager
 
-    async def handle(self, message: str) -> Optional[str]:
+    async def handle(self, message: str, user_id: Optional[str] = None) -> Optional[str]:
         stripped = message.strip()
 
-        if stripped in ("/exit", "/kill"):
+        if stripped in ("/exit", "/kill", "/quit"):
             await self.manager.terminate()
             return "🛑 AGY 进程已终止，已安全回到 `HOST_MODE`。"
 
+        if stripped in ("/agy", "/start"):
+            return (
+                f"ℹ️ AGY 独占会话已在运行中 (PID: {self.manager.pid})。\n"
+                f"系统已严格保证全局唯一对话进程，所有输入直接送达 AGY 智能体。\n"
+                f"• 重启会话：输入 `/new`\n"
+                f"• 退出会话：输入 `/exit` 或 `/quit`"
+            )
+
         if stripped == "/new":
-            await self.manager.restart()
+            await self.manager.restart(user_id=user_id)
             return f"🔄 AGY 会话已重启 (新 PID: {self.manager.pid})，继续处于 `AGY_MODE`。"
 
         if stripped in ("/ctrlc", "/stop"):
@@ -166,7 +201,13 @@ class AgyModeRouter:
         if stripped == "/help":
             return HELP_TEXT
 
-        if stripped.split()[0].lower() in ("/pwd", "/ls", "/cd"):
+        tokens = stripped.split()
+        if not tokens:
+            # User sent empty message or whitespace; treat as Enter to advance terminal
+            await self.manager.send_input("\r")
+            return None
+
+        if tokens[0].lower() in ("/pwd", "/ls", "/cd"):
             return (
                 "⚠️ 当前系统处于 `AGY_MODE`（AGY独占态）。\n"
                 "如需执行宿主导航命令 (`/pwd`, `/ls`, `/cd`)，请先输入 `/exit` 退出 AGY。"
@@ -202,6 +243,6 @@ class CommandRouter:
 
         # 3. State-based routing
         if self.manager.state == SystemState.HOST_MODE:
-            return await self.host_router.handle(message)
+            return await self.host_router.handle(message, user_id=user_id)
         else:
-            return await self.agy_router.handle(message)
+            return await self.agy_router.handle(message, user_id=user_id)

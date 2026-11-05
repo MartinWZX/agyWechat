@@ -117,3 +117,70 @@ async def test_agy_mode_routing_and_passthrough(sandbox_env):
     resp_exit = await router.route("authorized_user", "/exit")
     assert "回到 `HOST_MODE`" in resp_exit
     assert manager.state == SystemState.HOST_MODE
+
+
+@pytest.mark.asyncio
+async def test_host_mode_status_and_help(sandbox_env):
+    settings, manager, router, workspace = sandbox_env
+
+    # /status in HOST_MODE
+    resp_status = await router.route("authorized_user", "/status")
+    assert "系统运行状态" in resp_status
+    assert "HOST_MODE" in resp_status
+
+    # /help in HOST_MODE
+    resp_help = await router.route("authorized_user", "/help")
+    assert "WeChat-AGY Bridge 帮助手册" in resp_help
+    assert "Google AGY 智能体原生命令" in resp_help
+
+
+@pytest.mark.asyncio
+async def test_agy_mode_duplicate_agy_and_quit(sandbox_env):
+    settings, manager, router, workspace = sandbox_env
+
+    # Start AGY session
+    await router.route("authorized_user", "/agy")
+    assert manager.state == SystemState.AGY_MODE
+
+    # Send /agy while in AGY_MODE -> should warn, not spawn second process
+    resp_dup = await router.route("authorized_user", "/agy")
+    assert "AGY 独占会话已在运行中" in resp_dup
+    assert manager.state == SystemState.AGY_MODE
+
+    # Send /quit -> should exit to HOST_MODE
+    resp_quit = await router.route("authorized_user", "/quit")
+    assert "回到 `HOST_MODE`" in resp_quit
+    assert manager.state == SystemState.HOST_MODE
+
+
+@pytest.mark.asyncio
+async def test_agy_mode_empty_and_whitespace_input(sandbox_env):
+    settings, manager, router, workspace = sandbox_env
+
+    await router.route("authorized_user", "/agy")
+    assert manager.state == SystemState.AGY_MODE
+
+    # Sending empty or whitespace message must not crash with IndexError
+    resp_empty = await router.route("authorized_user", "   ")
+    assert resp_empty is None  # Input was sent as \r
+
+    await router.route("authorized_user", "/exit")
+    assert manager.state == SystemState.HOST_MODE
+
+
+@pytest.mark.asyncio
+async def test_host_mode_path_with_spaces(sandbox_env):
+    settings, manager, router, workspace = sandbox_env
+
+    spaced_dir = workspace / "dir with spaces"
+    spaced_dir.mkdir()
+    (spaced_dir / "spaced_file.txt").write_text("ok")
+
+    # /ls with quotes
+    resp_ls = await router.route("authorized_user", '/ls "dir with spaces"')
+    assert "spaced_file.txt" in resp_ls
+
+    # /cd with quotes
+    resp_cd = await router.route("authorized_user", '/cd "dir with spaces"')
+    assert "工作目录已切换至" in resp_cd
+    assert manager.GLOBAL_CWD == spaced_dir.resolve()

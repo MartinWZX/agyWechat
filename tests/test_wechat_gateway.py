@@ -126,3 +126,44 @@ async def test_push_queue_retry_on_failure():
     await mock_client.aclose()
 
     assert attempts >= 2
+
+
+@pytest.mark.asyncio
+async def test_active_user_protection_against_unauthorized_user():
+    settings = Settings(ALLOWED_USERS=["admin_user"])
+    gateway = WeChatGateway(settings=settings)
+
+    # Initial active user defaults to first allowed user
+    assert gateway.active_user == "admin_user"
+
+    # Unauthorized user sends incoming message
+    await gateway.enqueue_incoming("hacker_user", "malicious_payload")
+    # Active user MUST NOT be changed to hacker_user!
+    assert gateway.active_user == "admin_user"
+
+    # Authorized user sends incoming message
+    await gateway.enqueue_incoming("admin_user", "/pwd")
+    assert gateway.active_user == "admin_user"
+
+
+@pytest.mark.asyncio
+async def test_wechat_pusher_access_token_query_injection():
+    recorded_urls = []
+
+    async def mock_handler(request: httpx.Request):
+        recorded_urls.append(str(request.url))
+        return httpx.Response(200, json={"errcode": 0})
+
+    transport = httpx.MockTransport(mock_handler)
+    mock_client = httpx.AsyncClient(transport=transport)
+
+    settings = Settings(
+        WECHAT_PUSH_URL="https://api.weixin.qq.com/cgi-bin/message/custom/send",
+        WECHAT_BOT_SECRET="my_access_token_123",
+    )
+    pusher = WeChatPusher(settings=settings, client=mock_client)
+    await pusher.send_raw("target_user", "test_content")
+    await mock_client.aclose()
+
+    assert len(recorded_urls) == 1
+    assert "access_token=my_access_token_123" in recorded_urls[0]

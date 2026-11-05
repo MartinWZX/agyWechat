@@ -47,6 +47,7 @@ class SingletonAGYManager:
         self._reader_task: Optional[asyncio.Task] = None
         self._monitor_task: Optional[asyncio.Task] = None
         self._is_terminating: bool = False
+        self.session_owner: Optional[str] = None
 
     @property
     def state(self) -> SystemState:
@@ -71,6 +72,7 @@ class SingletonAGYManager:
         self,
         cwd: Optional[Path] = None,
         extra_args: Optional[List[str]] = None,
+        user_id: Optional[str] = None,
     ) -> None:
         """Spawn a single agy process inside a POSIX PTY and enter AGY_MODE."""
         async with self._lock:
@@ -80,7 +82,15 @@ class SingletonAGYManager:
             # Ensure previous state is cleanly reset
             await self._cleanup_internal()
 
+            self.session_owner = user_id
+
             target_cwd = (cwd or self.GLOBAL_CWD).resolve()
+            # Enforce sandbox boundary protection
+            try:
+                target_cwd.relative_to(self.settings.WORKSPACE_ROOT)
+            except ValueError:
+                raise ValueError(f"Spawn directory `{target_cwd}` escapes sandbox root `{self.settings.WORKSPACE_ROOT}`")
+
             if not target_cwd.exists():
                 target_cwd.mkdir(parents=True, exist_ok=True)
             self.GLOBAL_CWD = target_cwd
@@ -168,10 +178,15 @@ class SingletonAGYManager:
             self._state = SystemState.HOST_MODE
             logger.info("agy process terminated. Reverted to HOST_MODE.")
 
-    async def restart(self, extra_args: Optional[List[str]] = None) -> None:
+    async def restart(
+        self,
+        extra_args: Optional[List[str]] = None,
+        user_id: Optional[str] = None,
+    ) -> None:
         """Terminate existing agy process and spawn a fresh one (/new implementation)."""
+        target_user = user_id or self.session_owner
         await self.terminate()
-        await self.spawn(cwd=self.GLOBAL_CWD, extra_args=extra_args)
+        await self.spawn(cwd=self.GLOBAL_CWD, extra_args=extra_args, user_id=target_user)
 
     async def send_input(self, text: str) -> None:
         """Write input text plus carriage return to the PTY master fd."""
@@ -248,8 +263,16 @@ class SingletonAGYManager:
         if self._is_terminating:
             return
 
+        # Allow _reader_task to drain remaining bytes from PTY buffer until EOF/EIO
+        if self._reader_task and not self._reader_task.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(self._reader_task), timeout=0.8)
+            except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+                pass
+
         async with self._lock:
             if not self._is_terminating:
+                saved_owner = self.session_owner
                 await self._cleanup_internal()
                 self._state = SystemState.HOST_MODE
                 if self.push_callback:
@@ -263,7 +286,7 @@ class SingletonAGYManager:
             try:
                 pgid = os.getpgid(pid)
                 os.killpg(pgid, signal.SIGTERM)
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(0.3)
                 try:
                     os.killpg(pgid, signal.SIGKILL)
                 except ProcessLookupError:
@@ -298,14 +321,19 @@ class SingletonAGYManager:
                 pass
             self._slave_fd = None
 
-        # Cancel background tasks safely
+        # Cancel background tasks safely and await them to ensure clean shutdown
         curr = asyncio.current_task()
         for task in (self._reader_task, self._monitor_task):
             if task and not task.done() and task is not curr:
                 task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
 
         self._reader_task = None
         self._monitor_task = None
+        self.session_owner = None
 
         # Close debounce buffer
         if self._debounce_buffer:
@@ -320,9 +348,14 @@ class SingletonAGYManager:
 
     def _psutil_cleanup(self) -> None:
         """Scan and kill any remaining orphan agy processes."""
+        target_name = Path(self.settings.AGY_BINARY).name
+        # Protect generic system shells and interpreters from global killing during tests
+        UNSAFE_TARGETS = {"bash", "sh", "zsh", "python", "python3", "pytest", "dash"}
+        if target_name.lower() in UNSAFE_TARGETS:
+            return
+
         current_pid = os.getpid()
         parent_pid = os.getppid()
-        target_name = Path(self.settings.AGY_BINARY).name
 
         for p in psutil.process_iter(["pid", "name", "cmdline"]):
             try:
@@ -334,7 +367,7 @@ class SingletonAGYManager:
                 cmdline = p.info["cmdline"] or []
 
                 is_target = False
-                if p_name == target_name or (target_name and p_name.startswith(target_name)):
+                if p_name == target_name:
                     is_target = True
                 elif cmdline and (
                     cmdline[0] == self.settings.AGY_BINARY
