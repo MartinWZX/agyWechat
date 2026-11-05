@@ -42,22 +42,29 @@ def print_ascii_qr(url_or_code: str, qr_img_path: Path) -> None:
         img.save(str(qr_img_path))
         print(f"🖼️ 二维码图片已保存至: {qr_img_path}")
 
-        # Also copy to brain artifact directory if present
-        brain_dir = Path("/home/martin/.gemini/antigravity-cli/brain/dcd16095-ffc4-4075-a401-fa10dd7581cf")
-        if brain_dir.exists():
-            try:
-                shutil.copyfile(str(qr_img_path), str(brain_dir / "wechat_qr.png"))
-            except Exception:
-                pass
+        # Optional: copy to artifact directory if AGY_BRAIN_DIR is set
+        brain_env = os.environ.get("AGY_BRAIN_DIR")
+        if brain_env:
+            brain_dir = Path(brain_env)
+            if brain_dir.exists():
+                try:
+                    shutil.copyfile(str(qr_img_path), str(brain_dir / "wechat_qr.png"))
+                except Exception:
+                    pass
 
-        # Also copy to Windows desktop for visual access
-        desktop_dir = Path("/mnt/c/Users/admin/Desktop")
-        if desktop_dir.exists():
-            try:
-                shutil.copyfile(str(qr_img_path), str(desktop_dir / "wechat_qr.png"))
-                print(f"🖥️ 二维码已放置在 Windows 桌面: {desktop_dir / 'wechat_qr.png'}")
-            except Exception:
-                pass
+        # Optional: auto-detect WSL Windows desktop for visual convenience
+        users_dir = Path("/mnt/c/Users")
+        if users_dir.exists():
+            for u in users_dir.iterdir():
+                if u.is_dir() and u.name not in ("Default", "Public", "All Users", "defaultuser0"):
+                    desktop = u / "Desktop"
+                    if desktop.is_dir():
+                        try:
+                            shutil.copyfile(str(qr_img_path), str(desktop / "wechat_qr.png"))
+                            print(f"🖥️ 二维码已同步放置在桌面: {desktop / 'wechat_qr.png'}")
+                            break
+                        except Exception:
+                            pass
     except Exception as e:
         print(f"⚠️ 终端渲染二维码提示: {e}")
         print(f"🌐 请直接在浏览器中打开二维码链接:\n   {url_or_code}\n")

@@ -131,9 +131,12 @@ def create_app(
         """Detailed system status endpoint."""
         mgr: SingletonAGYManager = app.state.manager
         gw: WeChatGateway = app.state.gateway
+        ilink_active = bool(getattr(app.state, "ilink_worker", None) and app.state.ilink_worker._running)
         return {
             "status": "online",
             "version": __version__,
+            "channel": app_settings.WECHAT_CHANNEL,
+            "ilink_active": ilink_active,
             "state": mgr.state.value,
             "cwd": str(mgr.GLOBAL_CWD),
             "workspace_root": str(app_settings.WORKSPACE_ROOT),

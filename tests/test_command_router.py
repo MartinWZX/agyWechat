@@ -120,6 +120,25 @@ async def test_agy_mode_routing_and_passthrough(sandbox_env):
 
 
 @pytest.mark.asyncio
+async def test_agy_mode_status(sandbox_env):
+    settings, manager, router, workspace = sandbox_env
+
+    # Start AGY session
+    await router.route("authorized_user", "/agy")
+    assert manager.state == SystemState.AGY_MODE
+
+    # /status in AGY_MODE
+    resp_status = await router.route("authorized_user", "/status")
+    assert "系统运行状态" in resp_status
+    assert "AGY_MODE" in resp_status
+    assert "PID" in resp_status
+    assert "authorized_user" in resp_status
+
+    await router.route("authorized_user", "/exit")
+    assert manager.state == SystemState.HOST_MODE
+
+
+@pytest.mark.asyncio
 async def test_host_mode_status_and_help(sandbox_env):
     settings, manager, router, workspace = sandbox_env
 

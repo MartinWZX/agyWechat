@@ -62,9 +62,11 @@ class HostModeRouter:
 
         if cmd == "/status":
             agy_status = f"运行中 (PID: {self.manager.pid})" if self.manager.is_running() else "未运行（就绪）"
+            channel_info = "微信个人号直连 (iLink Bot)" if (self.settings.WECHAT_CHANNEL == "ilink" or self.settings.WEIXIN_TOKEN) else "WebHook 消息回调"
             return (
                 f"📊 *WeChat-AGY 系统运行状态*\n"
                 f"• 当前状态：`HOST_MODE`（宿主导航态）\n"
+                f"• 通讯通道：`{channel_info}`\n"
                 f"• 工作目录：`{self.manager.GLOBAL_CWD}`\n"
                 f"• AGY 进程：{agy_status}\n"
                 f"• 沙箱根目录：`{self.settings.WORKSPACE_ROOT}`\n\n"
@@ -172,8 +174,9 @@ class HostModeRouter:
 class AgyModeRouter:
     """Handles commands and message passthrough while system is in AGY_MODE."""
 
-    def __init__(self, manager: SingletonAGYManager):
+    def __init__(self, manager: SingletonAGYManager, settings: Optional[Settings] = None):
         self.manager = manager
+        self.settings = settings
 
     async def handle(self, message: str, user_id: Optional[str] = None) -> Optional[str]:
         stripped = message.strip()
@@ -197,6 +200,19 @@ class AgyModeRouter:
         if stripped in ("/ctrlc", "/stop"):
             await self.manager.send_ctrl_c()
             return "⚡ 已向 AGY 终端发送 Ctrl+C (SIGINT) 中断信号。"
+
+        if stripped == "/status":
+            channel_info = "微信个人号直连 (iLink Bot)" if (self.settings and (self.settings.WECHAT_CHANNEL == "ilink" or self.settings.WEIXIN_TOKEN)) else "WebHook 消息回调"
+            owner = self.manager.session_owner or "当前用户"
+            return (
+                f"📊 *WeChat-AGY 系统运行状态*\n"
+                f"• 当前状态：`AGY_MODE`（AGY独占态，运行中）\n"
+                f"• 进程 PID：`{self.manager.pid}`\n"
+                f"• 会话归属：`{owner}`\n"
+                f"• 通讯通道：`{channel_info}`\n"
+                f"• 工作目录：`{self.manager.GLOBAL_CWD}`\n\n"
+                f"💡 当前所有输入直接透传给 AGY；输入 `/exit` 可终止并返回宿主导航态。"
+            )
 
         if stripped == "/help":
             return HELP_TEXT
@@ -229,7 +245,7 @@ class CommandRouter:
         self.settings = settings or get_settings()
         self.manager = manager or get_agy_manager(self.settings)
         self.host_router = HostModeRouter(self.manager, self.settings)
-        self.agy_router = AgyModeRouter(self.manager)
+        self.agy_router = AgyModeRouter(self.manager, self.settings)
 
     async def route(self, user_id: str, message: str) -> Optional[str]:
         """Route user message, returning direct response string or None if passed through."""
