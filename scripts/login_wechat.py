@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""WeChat (Weixin) Personal Account QR Code Login Tool for WeChat-AGY Bridge.
+"""WeChat (Weixin) Personal Account QR Code Login Tool for WeChat Multi-CLI Agent.
 
 This tool communicates with Tencent's official iLink Bot API to generate a login QR code,
 waits for mobile WeChat confirmation, and automatically saves the credentials to .env.
@@ -13,7 +13,7 @@ import time
 from pathlib import Path
 
 # Auto re-exec into project virtualenv if needed
-PROJECT_ROOT = Path(__file__).resolve().parent
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 venv_python = PROJECT_ROOT / "venv" / "bin" / "python"
 if venv_python.exists() and sys.executable != str(venv_python):
     os.execl(str(venv_python), str(venv_python), *sys.argv)

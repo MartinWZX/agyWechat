@@ -92,5 +92,5 @@ agyWechat/
 ## 🧪 运行测试套件
 
 ```bash
-python3 -m unittest tests/test_full_system.py
+./venv/bin/pytest tests/
 ```
