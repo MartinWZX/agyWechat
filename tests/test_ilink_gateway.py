@@ -7,8 +7,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 
-from app.config import Settings
-from app.ilink_gateway import (
+from config import Settings
+from gateway.ilink_gateway import (
     ContextTokenStore,
     ILinkAPIClient,
     ILinkGatewayWorker,

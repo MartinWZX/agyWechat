@@ -2,7 +2,7 @@
 
 import asyncio
 import pytest
-from app.terminal_cleaner import (
+from gateway.terminal_cleaner import (
     ANSICleaner,
     IncrementalExtractor,
     ApprovalDetector,
