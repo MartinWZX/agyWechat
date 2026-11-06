@@ -99,6 +99,10 @@ class WeChatGateway:
         success, answer, _ = await self.hub.execute_task(prompt, manifest, priority=0)
         return answer if success else f"抱歉，系统暂时无法处理该请求：{answer}"
 
+    async def route(self, user_id: str, content: str) -> str:
+        """Unified routing entrypoint for iLink Gateway and external controllers."""
+        return await self.process_inbound_message(user_id, content)
+
     def process_incoming_message(self, msg_id: str, user_id: str, msg_type: str, raw_payload: str) -> str:
         """Synchronous inbound message processing used in full-system test suite."""
         is_voice = (msg_type == "voice")

@@ -13,7 +13,7 @@ def run_dashboard() -> str:
         icon = "🟢" if state == "CLOSED" else ("🟡" if "429" in state else "🔴")
         lines.append(f"{icon} {eng.upper()}: 状态={state} | 今日调用={calls}次 | 切换={fo}次")
     
-    offload = round(stats.get("offload_rate", 0) * 100, 1)
+    offload = round(stats.get("offload_rate", 0.0), 1)
     lines.append(f"\n📊 纯代码卸载率 (L0+Cron): {offload}% (目标 >= 90%)")
     lines.append(f"🎙️ 微信语音交互数: {stats.get('voice_messages', 0)} 条")
     return "\n".join(lines)

@@ -285,7 +285,7 @@ class ContextTokenStore:
 
 
 class ILinkGatewayWorker:
-    """Background worker that long-polls iLink Bot updates and coordinates with UnifiedRouter."""
+    """Background worker that long-polls iLink Bot updates and coordinates with WeChatGateway."""
 
     def __init__(self, settings: Settings, router: Any, token_store: Optional[ContextTokenStore] = None):
         self.settings = settings
@@ -305,10 +305,10 @@ class ILinkGatewayWorker:
         return user_id in self.settings.ALLOWED_USERS
 
     async def on_terminal_output(self, text: str) -> None:
-        """Callback invoked by SingletonAGYManager when PTY emits cleaned output."""
+        """Callback invoked by PTY Bridge when terminal emits cleaned output."""
         target_user = None
-        if self.router and hasattr(self.router, "manager") and self.router.manager:
-            target_user = self.router.manager.session_owner
+        if self.router and hasattr(self.router, "active_user") and self.router.active_user:
+            target_user = self.router.active_user
         if not target_user:
             target_user = self.active_user
         if target_user:
@@ -413,9 +413,14 @@ class ILinkGatewayWorker:
 
         self.active_user = from_user
 
-        # Route message to UnifiedRouter
+        # Route message to WeChatGateway / Router
         try:
-            reply = await self.router.route(from_user, text_content)
+            if hasattr(self.router, "route"):
+                reply = await self.router.route(from_user, text_content)
+            elif hasattr(self.router, "process_inbound_message"):
+                reply = await self.router.process_inbound_message(from_user, text_content)
+            else:
+                reply = "Router does not implement route or process_inbound_message."
             if reply:
                 chunks = self.pusher.splitter.split(reply)
                 for chunk in chunks:

@@ -13,6 +13,7 @@ from fastapi.responses import PlainTextResponse
 from bridge.multi_cli_hub import MultiCLIHub
 from config import get_settings, load_yaml_config
 from gateway.wechat_gateway import WeChatGateway
+from gateway.ilink_gateway import ILinkGatewayWorker
 from guard.wind_control_governor import WindControlGovernor
 from memory.core_state_store import CoreStateStore
 from rsi.evolution_engine import EvolutionEngine
@@ -48,17 +49,22 @@ monitor = HealthMonitor(governor=governor, settings=settings, store=store)
 gateway = WeChatGateway(config=yaml_config, hub=hub, store=store, governor=governor, health_monitor=monitor, settings=settings)
 scheduler = CodeFirstCronScheduler(hub=hub, settings=settings)
 rsi_engine = EvolutionEngine(store=store, config=yaml_config)
+ilink_worker = ILinkGatewayWorker(settings=settings, router=gateway) if settings.WEIXIN_TOKEN else None
 
 
 @contextlib.asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Application lifespan: start background scheduler and RSI daemon."""
+    """Application lifespan: start background scheduler, RSI daemon, and optional iLink worker."""
     lock = acquire_main_lock()
     scheduler_task = asyncio.create_task(scheduler.start())
     rsi_task = asyncio.create_task(rsi_engine.start_daemon())
+    if ilink_worker:
+        ilink_worker.start()
     try:
         yield
     finally:
+        if ilink_worker:
+            await ilink_worker.stop()
         scheduler.stop()
         rsi_engine.stop_daemon()
         scheduler_task.cancel()
