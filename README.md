@@ -36,13 +36,11 @@ agyWechat/
 │       ├── .env.backup_wechat_disconnected
 │       └── .context_tokens.json.disabled
 │
-├── legacy/                      # 📦 历史代码归档（已由 12 大新核心模块全量替代）
-│   ├── app/                     # 旧版单体应用模块
-│   └── config.py                # 旧版 Python 配置脚本
-│
 ├── gateway/                     # 模块 1：微信消息网关、原生语音 Recognition 直提与同音纠错
 │   ├── wechat_gateway.py        # 微信消息总线与 L0 规则直回
-│   └── voice_normalizer.py      # 微信语音识别解析与拼音同音映射
+│   ├── voice_normalizer.py      # 微信语音识别解析与拼音同音映射
+│   ├── ilink_gateway.py         # 微信 iLink 官方机器人协议与长轮询接入
+│   └── terminal_cleaner.py      # 终端 ANSI 转义字符清洗与微信文本分片
 ├── crystallizer/                # 模块 2：文字/语音特征挖掘与自动固化引擎
 │   └── pattern_crystallizer.py  # 模式提取与影子实测准入
 ├── scheduler/                   # 模块 3：二段式代码优先定时调度器
@@ -60,8 +58,6 @@ agyWechat/
 │       └── omp_driver.py        # omp 驱动
 ├── compressor/                  # 模块 6：认知准入守门员与源头数据预检
 │   └── cognitive_gate.py        # 脏数据/残缺语音拦截与 [DATA_ANCHOR_MANIFEST]
-├── verifier/                    # 模块 12：全链路四维反幻觉确定性审计引擎
-│   └── hallucination_guard.py   # 物理快照差分、逻辑自洽与影子实测校验
 ├── memory/                      # 模块 7：SQLite WAL 单写连接状态机与三层记忆
 │   └── core_state_store.py      # 短期会话、FTS5 长期记忆与审计表
 ├── skills/                      # 模块 8：四级技能管理与 L0 纯代码脚本库
@@ -73,8 +69,16 @@ agyWechat/
 │   └── approval_guard.py        # 危险命令阻断与高危操作微信确认
 ├── telemetry/                   # 模块 11：全链路可观测性与运行看板
 │   └── health_monitor.py        # 纯代码卸载率与风控看板
+├── verifier/                    # 模块 12：全链路四维反幻觉确定性审计引擎
+│   └── hallucination_guard.py   # 物理快照差分、逻辑自洽与影子实测校验
+├── rsi/                         # 模块 13：RSI 递归自演进总控引擎
+│   └── evolution_engine.py      # 驱动 LLM-First -> Code-First 全周期生命周期演进
 └── tests/                       # 🧪 自动化测试套件
-    └── test_full_system.py      # 端到端 12 模块完整性集成测试
+    ├── test_code_first_system.py # 核心系统与全链路集成测试
+    ├── test_full_system.py       # 12 核心模块综合测试
+    ├── test_rsi_evolution.py     # RSI 自演进与时序 Cron 固化测试
+    ├── test_ilink_gateway.py     # 微信 iLink 协议与 Poller 测试
+    └── test_terminal_cleaner.py  # 终端 ANSI 与分片算法测试
 ```
 
 ---

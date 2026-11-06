@@ -7,12 +7,12 @@ import logging
 import secrets
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import httpx
 
-from app.config import Settings
-from app.terminal_cleaner import WeChatSplitter
+from config import Settings
+from gateway.terminal_cleaner import WeChatSplitter
 
 logger = logging.getLogger("wechat_agy.ilink")
 
@@ -332,8 +332,8 @@ class ILinkGatewayWorker:
             self._task.cancel()
             try:
                 await self._task
-            except asyncio.CancelledError:
-                pass
+            except asyncio.CancelledError as err:
+                logger.debug("Task cancel handled: %s", err)
             self._task = None
         logger.info("iLink WeChat background polling worker stopped.")
 

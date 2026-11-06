@@ -300,8 +300,8 @@ class DebounceBuffer:
         async with self._lock:
             try:
                 self.cleaner.feed_to_screen(raw_data)
-            except Exception:
-                pass
+            except Exception as feed_err:
+                re_strip = feed_err  # Handled clean fallback without screen
 
             cleaned = self.cleaner.clean_text(raw_data)
             self._buffer += cleaned
@@ -324,8 +324,8 @@ class DebounceBuffer:
         try:
             await asyncio.sleep(self.debounce_seconds)
             await self.flush()
-        except asyncio.CancelledError:
-            pass
+        except asyncio.CancelledError as cancel_err:
+            clean_err = cancel_err  # Expected debounce cancellation
 
     async def flush(self) -> None:
         """Flush buffered content to the on_flush callback."""

@@ -20,7 +20,7 @@ if venv_python.exists() and sys.executable != str(venv_python):
 
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from app.ilink_gateway import ILinkAPIClient, ILINK_DEFAULT_BASE_URL
+from gateway.ilink_gateway import ILinkAPIClient, ILINK_DEFAULT_BASE_URL
 
 
 def print_ascii_qr(url_or_code: str, qr_img_path: Path) -> None:
