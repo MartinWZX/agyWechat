@@ -19,10 +19,10 @@ import signal
 import struct
 import termios
 import time
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, List, Optional
 
 from config import Settings, get_settings
-from guard.wind_control_governor import WindControlGovernor, CircuitState
+from guard.wind_control_governor import WindControlGovernor
 
 logger = logging.getLogger("wechat_agy.bridge")
 

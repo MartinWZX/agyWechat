@@ -10,7 +10,8 @@
 
 ```text
 agyWechat/
-├── main.py                      # 全局唯一单进程主入口（flock 锁、总线初始化）
+├── main.py                      # 全局唯一单进程主入口（flock 锁、FastAPI 与总线初始化）
+├── config.py                    # 统一配置桥接器（Pydantic Settings + YAML 加载）
 ├── config.yaml                  # 生产级核心配置（CLI 路径、风控阈值、同音字表）
 ├── run.sh                       # 宿主机一键启动脚本
 ├── requirements.txt             # Python 核心依赖清单
@@ -25,16 +26,12 @@ agyWechat/
 │   ├── ARCHITECTURE.md          # 详细系统架构白皮书
 │   └── PROJECT_INTRODUCTION.md  # 项目背景与演进介绍
 │
-├── scripts/                     # 🛠️ 运维部署、登录及构建工具脚本
-│   ├── build_production_system.py # 系统生产构建脚手架
-│   └── login_wechat.py          # 微信登录交互脚本
+├── scripts/                     # 🛠️ 运维部署与登录工具脚本
+│   └── login_wechat.py          # 微信登录交互脚本（腾讯官方 iLink 扫码）
 │
-├── deploy/                      # 🚀 部署配置与备份资产
-│   ├── systemd/                 # systemd 守护服务单元文件
-│   │   └── agy-wechat.service.disabled
-│   └── backups/                 # 历史连接与配置备份
-│       ├── .env.backup_wechat_disconnected
-│       └── .context_tokens.json.disabled
+├── deploy/                      # 🚀 部署配置
+│   └── systemd/                 # systemd 守护服务单元文件示例
+│       └── agy-wechat.service.example
 │
 ├── gateway/                     # 模块 1：微信消息网关、原生语音 Recognition 直提与同音纠错
 │   ├── wechat_gateway.py        # 微信消息总线与 L0 规则直回

@@ -3,7 +3,7 @@ import hashlib
 import json
 import re
 from enum import Enum
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 
 class InvocationReason(str, Enum):

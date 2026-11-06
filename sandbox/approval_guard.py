@@ -5,7 +5,7 @@ import os
 import re
 import time
 from enum import IntEnum
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Tuple, Union
 
 
 class SandboxSecurityError(Exception):
