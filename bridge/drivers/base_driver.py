@@ -16,7 +16,7 @@ class BaseCLIAgentDriver(abc.ABC):
 
     @abc.abstractmethod
     def build_one_liner_cmd(self, prompt: str) -> List[str]:
-        pass
+        raise NotImplementedError("Subclasses must implement build_one_liner_cmd")
 
     async def execute_one_liner(self, prompt: str, workspace_dir: str) -> Tuple[int, str, str]:
         cmd = self.build_one_liner_cmd(prompt)

@@ -50,7 +50,7 @@ def print_ascii_qr(url_or_code: str, qr_img_path: Path) -> None:
                 try:
                     shutil.copyfile(str(qr_img_path), str(brain_dir / "wechat_qr.png"))
                 except Exception:
-                    pass
+                    print(f"⚠️ 无法同步二维码至 brain 目录: {brain_dir}")
 
         # Optional: auto-detect WSL Windows desktop for visual convenience
         users_dir = Path("/mnt/c/Users")
@@ -64,7 +64,7 @@ def print_ascii_qr(url_or_code: str, qr_img_path: Path) -> None:
                             print(f"🖥️ 二维码已同步放置在桌面: {desktop / 'wechat_qr.png'}")
                             break
                         except Exception:
-                            pass
+                            print(f"⚠️ 桌面同步失败，保留本地终端二维码")
     except Exception as e:
         print(f"⚠️ 终端渲染二维码提示: {e}")
         print(f"🌐 请直接在浏览器中打开二维码链接:\n   {url_or_code}\n")

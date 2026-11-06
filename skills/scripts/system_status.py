@@ -9,7 +9,7 @@ def run_status() -> str:
         load1, load5, load15 = os.getloadavg()
         cpu_load = f"{load1:.2f}, {load5:.2f}, {load15:.2f}"
     except (AttributeError, OSError):
-        pass
+        cpu_load = "N/A"
 
     # 2. Memory Info from /proc/meminfo
     mem_percent = "N/A"
@@ -26,7 +26,7 @@ def run_status() -> str:
             used = total - avail
             mem_percent = f"{(used / total) * 100:.1f}%"
     except Exception:
-        pass
+        mem_percent = "N/A"
 
     # 3. Disk Usage
     disk_percent = "N/A"
@@ -34,7 +34,7 @@ def run_status() -> str:
         total_b, used_b, free_b = shutil.disk_usage("/")
         disk_percent = f"{(used_b / total_b) * 100:.1f}%"
     except Exception:
-        pass
+        disk_percent = "N/A"
 
     return f"【系统运行状态】\nCPU负载(1/5/15m): {cpu_load}\n内存占用: {mem_percent}\n根分区磁盘: {disk_percent}\n运行状态: 正常运行 (0 Token)"
 

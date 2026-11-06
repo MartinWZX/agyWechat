@@ -103,6 +103,17 @@ voice_normalization:
     "爱特派": "@pi"
     "爱特克劳德": "@claude"
     "爱特阿基": "@agy"
+    "演进看板": "#状态"
+
+crystallization:
+  faq_solidify_threshold: 3
+  periodicity_cv_threshold: 0.25
+  auto_cron_enabled: true
+
+rsi:
+  maturity_threshold_exploration: 0.4
+  maturity_threshold_convergence: 0.8
+  enable_self_healing: true
 
 anti_hallucination:
   strict_manifest_check: true

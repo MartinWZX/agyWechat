@@ -39,7 +39,8 @@ ANSI_ESCAPE_RE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])|\x1B\][^\x07
 
 class HostLockError(Exception):
     """Raised when another agy host process already holds the OS lock."""
-    pass
+    def __init__(self, message: str = "Host lock already held"):
+        super().__init__(message)
 
 
 class PriorityItem:
@@ -336,8 +337,8 @@ class AgyPTYBridge:
                         res = self.on_output_chunk(text)
                         if asyncio.iscoroutine(res):
                             await res
-                    except Exception:
-                        pass
+                    except Exception as err:
+                        logger.debug("Crystallize callback error: %s", err)
 
                 # Scan stream for 429 Rate Limit
                 if RE_429.search(text):
@@ -398,15 +399,15 @@ class AgyPTYBridge:
                     await asyncio.wait_for(self._process.wait(), timeout=3.0)
                 except asyncio.TimeoutError:
                     self._process.kill()
-            except Exception:
-                pass
+            except Exception as err:
+                logger.debug("Process kill error: %s", err)
             self._process = None
 
         if self._master_fd is not None:
             try:
                 os.close(self._master_fd)
-            except Exception:
-                pass
+            except Exception as err:
+                logger.debug("Master fd close error: %s", err)
             self._master_fd = None
 
         self.release_host_lock()
