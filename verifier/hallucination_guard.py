@@ -1,7 +1,6 @@
 """Deterministic 4D Anti-Hallucination & Consistency Verification Engine."""
 import os
 import ast
-import json
 import hashlib
 import re
 from typing import Dict, Any, List, Set, Tuple, Optional

@@ -2,7 +2,7 @@
 
 import json
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
@@ -12,7 +12,6 @@ from gateway.ilink_gateway import (
     ContextTokenStore,
     ILinkAPIClient,
     ILinkGatewayWorker,
-    ILinkPusher,
 )
 
 

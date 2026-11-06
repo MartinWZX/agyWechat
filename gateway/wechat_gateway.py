@@ -1,7 +1,6 @@
 """WeChat Message Gateway with Native Voice ASR & L0 Zero-Token Interceptor."""
 import asyncio
 import re
-import time
 from typing import Any, Dict, Optional, Tuple
 from bridge.multi_cli_hub import MultiCLIHub
 from compressor.cognitive_gate import CognitiveGate, PreInferenceDataValidator

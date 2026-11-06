@@ -2,7 +2,6 @@
 import os
 import shutil
 import tempfile
-import time
 import unittest
 from crystallizer.pattern_crystallizer import PatternCrystallizer
 from memory.core_state_store import CoreStateStore
