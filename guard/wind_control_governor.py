@@ -5,7 +5,7 @@ import random
 import sqlite3
 import time
 from enum import Enum
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict, Optional, Tuple
 
 
 class CircuitState(str, Enum):

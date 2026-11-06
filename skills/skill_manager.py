@@ -1,7 +1,5 @@
 """Progressive 4-Level Skill Manager with Symlink Sync & Precipitation."""
 import glob
-import os
-import shutil
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 from verifier.hallucination_guard import ShadowDryRunValidator, ShadowDryRunError

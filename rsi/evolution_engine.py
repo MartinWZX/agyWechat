@@ -1,6 +1,5 @@
 """RSI (Recursive Self-Improvement) Evolution Engine: LLM-First -> Code-First Entropy Reduction."""
 import asyncio
-import json
 import logging
 import os
 import re

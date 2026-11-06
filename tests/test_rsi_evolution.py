@@ -4,7 +4,6 @@ import shutil
 import tempfile
 import time
 import unittest
-from pathlib import Path
 from crystallizer.pattern_crystallizer import PatternCrystallizer
 from memory.core_state_store import CoreStateStore
 from rsi.evolution_engine import EvolutionEngine, EvolutionStage, LifecyclePhaseController

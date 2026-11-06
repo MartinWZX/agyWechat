@@ -13,7 +13,7 @@ from verifier.hallucination_guard import (
     OverExecutionHallucinationError,
     LogicalContradictionError
 )
-from compressor.cognitive_gate import CognitiveGate, PreInferenceDataValidator
+from compressor.cognitive_gate import PreInferenceDataValidator
 from guard.wind_control_governor import WindControlGovernor
 from memory.core_state_store import CoreStateStore
 from sandbox.approval_guard import ApprovalGuard, SandboxSecurityError
