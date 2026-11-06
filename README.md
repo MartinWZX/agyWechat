@@ -1,206 +1,95 @@
-# WeChat-AGY Single-Process Bridge
+# Autonomous Multi-CLI Agent (Code-First, LLM-Last)
 
-> 将本地与服务器端 Google Antigravity CLI（`agy`）终端搬入微信聊天界面的生产级 Python 桥接服务。支持**个人号免公网免域名扫码直连（基于腾讯官方 iLink Bot 协议）**与**企业微信/ClawBot/公众号 Webhook 回调**双通道。
-
-[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
-[![FastAPI](https://img.shields.io/badge/FastAPI-0.110+-green.svg)](https://fastapi.tiangolo.com/)
-[![Tests](https://img.shields.io/badge/tests-48%20passed-brightgreen.svg)]()
+基于 **“代码优先、大模型兜底（Code-First, LLM-Last）”** 架构范式的生产级多智能体 CLI 统一编排系统。原生对接 Google `agy`、Pi `pi`、Claude Code `claude`、Oh-My-Pi `omp`，默认开启 `dangerously-skip-permissions` 全自主免确认执行，内置四维反幻觉物理校验与微信原生语音识别直提。
 
 ---
 
-## 1. 核心设计哲学
+## 📁 优化后的项目目录组织架构 (Clean Project Layout)
 
-- **严格单例 (Strict Singleton)**：全局任意时刻最多允许 1 个 `agy` 进程运行，全局 `asyncio.Lock` 杜绝多开。
-- **双态模态 (Dual-State Machine)**：`HOST_MODE`（宿主导航态）与 `AGY_MODE`（AGY 独占态）互斥切换。
-- **PTY 直通 (PTY Passthrough)**：基于 POSIX `pty.openpty()` 终端模拟，全量 TUI 交互，消息 100% 直通 stdin。
-- **流式净化与聚合 (Stream Cleaner)**：`pyte` 虚拟屏幕 + ANSI 剥离 + Spinner 动画帧去噪 + 1.5s 防抖合并 + 审批提示符秒级触发 + Markdown 代码块安全分片 (≤2000字符)。
-- **防御纵深 (Defense in Depth)**：三层进程清杀（`os.killpg` SIGTERM/SIGKILL → `process.kill()` → `psutil` 孤儿进程扫荡）。
+项目根目录保持高度整洁，核心功能采用领域模块化封装，非核心文件按功能归档至对应子目录：
+
+```text
+agyWechat/
+├── main.py                      # 全局唯一单进程主入口（flock 锁、总线初始化）
+├── config.yaml                  # 生产级核心配置（CLI 路径、风控阈值、同音字表）
+├── run.sh                       # 宿主机一键启动脚本
+├── requirements.txt             # Python 核心依赖清单
+├── pytest.ini                   # 测试套件配置文件
+├── .env / .env.example          # 环境配置与示例
+│
+├── AGENTS.md                    # 跨引擎统一主控规范（防幻觉、防 429 铁律）
+├── GEMINI.md                    # -> 供 Google agy 启动读取
+├── CLAUDE.md                    # -> 供 Claude Code 启动读取
+│
+├── docs/                        # 📚 项目架构与设计文档归档
+│   ├── ARCHITECTURE.md          # 详细系统架构白皮书
+│   └── PROJECT_INTRODUCTION.md  # 项目背景与演进介绍
+│
+├── scripts/                     # 🛠️ 运维部署、登录及构建工具脚本
+│   ├── build_production_system.py # 系统生产构建脚手架
+│   └── login_wechat.py          # 微信登录交互脚本
+│
+├── deploy/                      # 🚀 部署配置与备份资产
+│   ├── systemd/                 # systemd 守护服务单元文件
+│   │   └── agy-wechat.service.disabled
+│   └── backups/                 # 历史连接与配置备份
+│       ├── .env.backup_wechat_disconnected
+│       └── .context_tokens.json.disabled
+│
+├── legacy/                      # 📦 历史代码归档（已由 12 大新核心模块全量替代）
+│   ├── app/                     # 旧版单体应用模块
+│   └── config.py                # 旧版 Python 配置脚本
+│
+├── gateway/                     # 模块 1：微信消息网关、原生语音 Recognition 直提与同音纠错
+│   ├── wechat_gateway.py        # 微信消息总线与 L0 规则直回
+│   └── voice_normalizer.py      # 微信语音识别解析与拼音同音映射
+├── crystallizer/                # 模块 2：文字/语音特征挖掘与自动固化引擎
+│   └── pattern_crystallizer.py  # 模式提取与影子实测准入
+├── scheduler/                   # 模块 3：二段式代码优先定时调度器
+│   ├── code_first_cron.py       # Stage-1 纯代码 + Stage-2 认知唤醒
+│   └── jobs.json                # 定时任务注册表
+├── guard/                       # 模块 4：多引擎独立风控守卫（Anti-429 / Anti-403）
+│   └── wind_control_governor.py # 滑动窗口限流、拟人延迟与三态熔断
+├── bridge/                      # 模块 5：多智能体 CLI 桥接中心与 Failover 路由
+│   ├── multi_cli_hub.py         # 优先级调度与跨引擎热备切换
+│   └── drivers/                 # CLI 原生驱动实现
+│       ├── base_driver.py       # 抽象驱动（单行命令与常驻 PTY 双模）
+│       ├── agy_driver.py        # agy 驱动
+│       ├── pi_driver.py         # pi 驱动
+│       ├── claude_driver.py     # claude 驱动
+│       └── omp_driver.py        # omp 驱动
+├── compressor/                  # 模块 6：认知准入守门员与源头数据预检
+│   └── cognitive_gate.py        # 脏数据/残缺语音拦截与 [DATA_ANCHOR_MANIFEST]
+├── verifier/                    # 模块 12：全链路四维反幻觉确定性审计引擎
+│   └── hallucination_guard.py   # 物理快照差分、逻辑自洽与影子实测校验
+├── memory/                      # 模块 7：SQLite WAL 单写连接状态机与三层记忆
+│   └── core_state_store.py      # 短期会话、FTS5 长期记忆与审计表
+├── skills/                      # 模块 8：四级技能管理与 L0 纯代码脚本库
+│   ├── skill_manager.py         # 技能层级加载器
+│   └── scripts/                 # 确定性脚本库（system_status, dashboard, audit 等）
+├── tools/                       # 模块 9：确定性工具注册表与 Trace 审计
+│   └── tool_registry.py         # 工具执行记录与 Python/CLI/MCP 双模直调
+├── sandbox/                     # 模块 10：AST 沙盒安全守卫与微信 L1-L5 审批流
+│   └── approval_guard.py        # 危险命令阻断与高危操作微信确认
+├── telemetry/                   # 模块 11：全链路可观测性与运行看板
+│   └── health_monitor.py        # 纯代码卸载率与风控看板
+└── tests/                       # 🧪 自动化测试套件
+    └── test_full_system.py      # 端到端 12 模块完整性集成测试
+```
 
 ---
 
-## 2. 系统架构与双态模态
+## ⚡ 核心设计原则
 
-```
-                        服务启动
-                           │
-                           ▼
-                    ┌──────────────┐
-                    │  HOST_MODE   │ ◄──────────────────────────┐
-                    │  (宿主导航态) │                             │
-                    └──────┬───────┘                             │
-                           │                                     │
-         ┌─────────────────┼─────────────────┐                  │
-         ▼                 ▼                 ▼                   │
-     /pwd响应          /ls响应           /cd切换              /exit │
-     返回路径          返回列表         GLOBAL_CWD             /kill │
-                                                                 │
-                           │ /agy 或 /new                        │
-                           ▼                                     │
-                    ┌──────────────┐   agy进程                   │
-                    │  AGY_MODE    │   自行退出                   │
-                    │ (AGY独占态)   │──────────────────────────►──┘
-                    └──────┬───────┘
-                           │
-         ┌─────────────────┼──────────────────┐
-         ▼                 ▼                  ▼
-      /new重启          /ctrlc写           所有其他输入
-      杀旧启新          \x03到PTY          100%直通PTY stdin
-```
+1. **根目录极致清爽**：根目录仅保留入口文件（`main.py`）、主配置文件（`config.yaml`）、环境定义（`.env`）与规范规范（`AGENTS.md`），所有辅助文件、文档、旧版代码与部署资产均归整入专用子目录。
+2. **纯代码卸载率 $\ge 90\%$**：常规查询与高频微信语音/文字消息经由 L0 规则拦截，100% 由本地 Python 脚本毫秒级处理，0 Token 消耗，彻底消除 429 风控与幻觉。
+3. **物理反幻觉闭环**：通过物理状态前后快照差分（Git / Hash Diff），拦截“说多做少”与“说少做多”（自动回滚越权篡改）。
+4. **单行式与常驻 PTY 双模调度**：支持 `agy`、`pi`、`claude`、`omp` 官方二进制驱动，自动注入 `--dangerously-skip-permissions` 免确认执行。
 
 ---
 
-## 3. 命令操作手册
-
-### 3.1 宿主导航态 (`HOST_MODE`)
-在进入 AGY 之前，用户可通过微信命令浏览本地目录、选定工作区：
-
-| 命令 | 功能说明 | 示例 |
-|------|---------|------|
-| `/pwd` | 显示当前工作目录 | `/pwd` |
-| `/ls [路径]` | 查看指定或当前目录文件列表（带图标及大小） | `/ls` 或 `/ls src` |
-| `/cd <路径>` | 切换工作目录（严格受 `WORKSPACE_ROOT` 沙箱保护） | `/cd project-a` |
-| `/status` | 查看系统运行状态、沙箱与会话就绪态 | `/status` |
-| `/help` | 查看完整帮助手册 | `/help` |
-| `/agy` 或 `/new` | 在当前工作目录启动全局唯一 AGY 进程，进入 `AGY_MODE` | `/agy` |
-
-### 3.2 AGY 独占态 (`AGY_MODE`)
-一旦进入 `AGY_MODE`，普通命令与 AGY 原生指令直通 AGY，特殊控制命令被拦截：
-
-| 命令 | 功能说明 | 实现机制 |
-|------|---------|---------|
-| *任意文本输入 / 需求问答* | 100% 透传至 AGY 终端交互 | 写入 PTY master fd |
-| `/clear`, `/diff`, `/effort`, `/skills`, `/mcp`, `/tasks`, `/usage` 等 | Google AGY 原生 Slash 指令，100% 透传至 AGY 执行 | 写入 PTY master fd |
-| `/status` | 查看当前 AGY 运行态、PID、会话归属与通道详情 | 状态面板 |
-| `/ctrlc` 或 `/stop` | 向终端发送 SIGINT (Ctrl+C) 中断当前执行任务 | 写入 `\x03` |
-| `/new` | 强杀当前进程，并在当前目录重启全新 AGY 会话 | `restart()` |
-| `/exit`、`/quit` 或 `/kill` | 终止 AGY 会话，三层清杀后安全回到 `HOST_MODE` | `terminate()` |
-| `/agy` | 提示当前已处于单例独占态，杜绝多开 | 状态防呆提示 |
-| `/pwd`, `/ls`, `/cd` | 提示用户当前处于独占态，需先 `/exit` | 防误触提示 |
-
----
-
-## 4. 快速开始
-
-### 4.1 环境准备
-- Linux / macOS 操作系统
-- Python 3.10+
-- Google Antigravity CLI (`agy`) 已安装并配置在 `$PATH` 或 `~/.local/bin/agy`
-
-### 4.2 接入方式选择
-
-#### 方式 A：微信个人号免公网扫码直连（推荐）
-无需公网 IP、免域名备案与端口映射，通过腾讯 iLink Bot 协议出站直连：
-```bash
-./login_wechat.py
-```
-控制台将输出 ASCII 二维码并生成 `wechat_qr.png`。使用手机微信扫描并在手机端确认登录，凭证（`WEIXIN_TOKEN` 与 `WEIXIN_ACCOUNT_ID`）将自动持久化至 `.env`。
-
-#### 方式 B：Webhook 模式（企业微信 / 公众号 / ClawBot）
-从模板创建配置文件：
-```bash
-cp .env.example .env
-```
-根据实际情况修改 `.env`：
-```ini
-# 通信通道配置 (ilink 个人号直连 或 webhook)
-WECHAT_CHANNEL=ilink
-WEIXIN_ACCOUNT_ID=your_bot_id@im.bot
-WEIXIN_TOKEN=your_ilink_token
-WEIXIN_BASE_URL=https://ilinkai.weixin.qq.com
-
-# 微信 Webhook 校验 Token (Webhook 模式)
-WECHAT_TOKEN=your_wechat_webhook_token_here
-WECHAT_PUSH_URL=https://api.weixin.qq.com/cgi-bin/message/custom/send
-WECHAT_BOT_SECRET=your_wechat_bot_secret_here
-
-# 允许访问的微信用户 OpenID / iLink UserID 白名单 (* 表示全部允许)
-ALLOWED_USERS=["user_openid_1", "user_openid_2"]
-
-# 文件沙箱根目录 (/cd 无法越界此目录)
-WORKSPACE_ROOT=/path/to/your/workspace
-
-# agy 可执行文件路径（可配置为系统 PATH 中的 agy 或指定绝对路径）
-AGY_BINARY=agy
-
-# PTY 虚拟终端规格与防抖配置
-PTY_COLS=120
-PTY_ROWS=40
-DEBOUNCE_SECONDS=1.5
-MAX_CHUNK_CHARS=1500
-WECHAT_MAX_MSG_LEN=2000
-
-# 服务监听地址
-SERVICE_HOST=0.0.0.0
-SERVICE_PORT=8000
-```
-
-### 4.3 一键启动
-项目自带自检与一键启动脚本：
-```bash
-./run.sh
-```
-脚本将自动初始化虚拟环境、安装依赖、加载配置并启动 Uvicorn 服务。
-
----
-
-## 5. 接口说明
-
-| 端点 | 方法 | 说明 |
-|------|------|------|
-| `/webhook` | `GET` | 微信服务器接入校验（验证签名并返回 `echostr`） |
-| `/webhook` | `POST` | 微信消息接收端点，100ms 内极速响应 200 ACK，消息异步入队处理 |
-| `/health` | `GET` | 服务健康检查（返回系统状态、运行时间、PID 等） |
-| `/status` | `GET` | 当前系统状态详情（运行态、当前工作目录、活跃用户等） |
-| `/mock/wechat/push` | `POST` | 本地测试/开发专用 Mock 消息接收端点 |
-| `/mock/wechat/messages` | `GET` | 查看本地测试收到的所有 Mock 推送消息 |
-
----
-
-## 6. 自动化测试
-
-项目具备全方位的单元测试和端到端集成测试，涵盖终端 ANSI 净化、分片保护、进程单例、命令路由、双网关协议与闭环交付：
+## 🧪 运行测试套件
 
 ```bash
-# 运行全部 48 个自动化测试用例
-./venv/bin/pytest -v
-```
-
-测试模块说明：
-- `tests/test_terminal_cleaner.py`：测试 ANSI 控制符清洗、Spinner 去重、提示符检测、Markdown 代码块分片。
-- `tests/test_singleton_agy.py`：测试 PTY 分配、输入透传、Ctrl+C、自然退出感知、进程清杀与重启。
-- `tests/test_command_router.py`：测试白名单鉴权、沙箱安全越界拦截、双态（HOST/AGY）下 `/status` 与命令路由分发。
-- `tests/test_ilink_gateway.py`：测试腾讯 iLink Bot 协议鉴权头构造、扫码状态长轮询、消息解包与上下文 Token 缓存维护。
-- `tests/test_wechat_gateway.py`：测试微信标准签名校验、多种 Payload 解析、推送队列与指数重试。
-- `tests/test_e2e.py`：端到端模拟微信 Webhook 发送与消息接收的完整生命周期交互。
-
----
-
-## 7. 生产部署指南 (systemd)
-
-如需在生产服务器后台长期运行，可配置 systemd 服务单元：
-
-`/etc/systemd/system/agy-wechat.service`:
-```ini
-[Unit]
-Description=WeChat-AGY Single-Process Bridge
-After=network.target
-
-[Service]
-Type=simple
-User=your_username
-WorkingDirectory=/path/to/agyWechat
-ExecStart=/path/to/agyWechat/venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000 --lifespan on
-Restart=always
-RestartSec=3
-EnvironmentFile=/path/to/agyWechat/.env
-
-[Install]
-WantedBy=multi-user.target
-```
-
-启动并使能服务：
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now agy-wechat.service
-sudo systemctl status agy-wechat.service
+python3 -m unittest tests/test_full_system.py
 ```

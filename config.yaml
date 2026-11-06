@@ -1,0 +1,113 @@
+# Autonomous Multi-CLI Agent Production Configuration
+system:
+  app_name: "autonomous_multi_cli_agent"
+  workspace_dir: "."
+  lock_dir: "/tmp/agent_core/locks"
+  db_path: "memory/agent_core.db"
+  tool_trace_path: "tools/tool_execution_trace.jsonl"
+  snapshot_ignore_patterns:
+    - "*.pyc"
+    - "__pycache__"
+    - ".git"
+    - "*.db*"
+    - "*.log"
+    - "*.tmp"
+    - "tool_execution_trace.jsonl"
+
+engines:
+  primary: "agy"
+  failover_order:
+    - "agy"
+    - "pi"
+    - "claude"
+    - "omp"
+  
+  agy:
+    binary: "agy"
+    mode: "one_liner" # one_liner | pty
+    dangerously_skip_permissions_flag: "--dangerously-skip-permissions"
+    default_model: "flash"
+    timeout_seconds: 60
+    max_turns: 3
+    pty_lock_file: "/tmp/agent_core/locks/agy.lock"
+
+  pi:
+    binary: "pi"
+    mode: "one_liner"
+    dangerously_skip_permissions_flag: "--no-confirm"
+    default_model: "light"
+    timeout_seconds: 45
+    max_turns: 3
+    pty_lock_file: "/tmp/agent_core/locks/pi.lock"
+
+  claude:
+    binary: "claude"
+    mode: "one_liner"
+    dangerously_skip_permissions_flag: "--dangerously-skip-permissions"
+    default_model: "haiku"
+    timeout_seconds: 60
+    max_turns: 3
+    pty_lock_file: "/tmp/agent_core/locks/claude.lock"
+
+  omp:
+    binary: "omp"
+    mode: "one_liner"
+    dangerously_skip_permissions_flag: "--dangerously-skip-permissions --yes"
+    default_model: "default"
+    timeout_seconds: 60
+    max_turns: 3
+    pty_lock_file: "/tmp/agent_core/locks/omp.lock"
+
+wind_control:
+  min_call_interval_seconds: 12.0
+  human_cadence:
+    min_jitter_seconds: 1.5
+    max_jitter_seconds: 4.8
+  limits:
+    window_5m_max_calls: 6
+    window_1h_max_calls: 30
+    window_24h_max_calls: 200
+  quiet_hours:
+    enabled: true
+    start_time: "01:00"
+    end_time: "07:00"
+    allow_p0_urgent: true
+  circuit_breaker:
+    cooldown_429_seconds: [120, 600, 1800]
+    lockdown_403_seconds: 86400
+
+voice_normalization:
+  spoken_fillers:
+    - "呃"
+    - "嗯"
+    - "那个"
+    - "请问"
+    - "帮我看一下"
+    - "帮我"
+    - "查一下"
+    - "你好"
+    - "哎"
+  homophone_corrections:
+    "丰控看板": "#风控看板"
+    "封控看板": "#风控看板"
+    "蜂控看板": "#风控看板"
+    "风控看板": "#风控看板"
+    "幻觉审计": "#幻觉审计"
+    "环境审计": "#幻觉审计"
+    "查看状态": "#状态"
+    "系统状态": "#状态"
+    "切换引擎派": "@pi"
+    "切换引擎克劳德": "@claude"
+    "切换引擎阿基": "@agy"
+    "用派执行": "@pi"
+    "爱特派": "@pi"
+    "爱特克劳德": "@claude"
+    "爱特阿基": "@agy"
+
+anti_hallucination:
+  strict_manifest_check: true
+  allow_phantom_execution: false
+  allow_unauthorized_overreach: false
+  auto_revert_overreach: true
+  shadow_dry_run_timeout: 10
+  reject_on_insufficient_evidence: true
