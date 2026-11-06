@@ -17,14 +17,12 @@ from pathlib import Path
 import tempfile
 import time
 import pytest
-from httpx import ASGITransport, AsyncClient
-
 from bridge.agy_pty_bridge import AgyPTYBridge, HostLockError
 from compressor.cognitive_gate import ContextCompressor, InvocationReason, PreFlightGate
 from config import Settings
 from crystallizer.pattern_crystallizer import PatternCrystallizer
-from gateway.wechat_gateway import RuleMatcher, WeChatGateway
-from guard.wind_control_governor import CircuitState, WindControlGovernor
+from gateway.wechat_gateway import WeChatGateway
+from guard.wind_control_governor import WindControlGovernor
 from memory.core_state_store import CoreStateStore
 from sandbox.approval_guard import ApprovalGuard, PermissionLevel
 from scheduler.code_first_cron import CodeFirstCronScheduler, RequireCognitiveAGY

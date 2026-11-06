@@ -20,7 +20,6 @@ if venv_python.exists() and sys.executable != str(venv_python):
 
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from app.config import get_settings
 from app.ilink_gateway import ILinkAPIClient, ILINK_DEFAULT_BASE_URL
 
 

@@ -5,12 +5,11 @@ import fcntl
 import json
 import logging
 import os
-import sys
 import time
-from typing import Any, Dict
+from typing import Any
 import yaml
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.responses import PlainTextResponse
 
 from bridge.multi_cli_hub import MultiCLIHub
 from config import get_settings, load_yaml_config

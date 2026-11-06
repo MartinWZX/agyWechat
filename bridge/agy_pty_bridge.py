@@ -21,8 +21,6 @@ import termios
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-import psutil
-
 from config import Settings, get_settings
 from guard.wind_control_governor import WindControlGovernor, CircuitState
 
