@@ -56,3 +56,8 @@ tools/tool_execution_trace.jsonl
 # Deploy backups & credentials
 deploy/backups/
 *.disabled
+
+# Runtime crystallized scripts & tool version snapshots
+skills/scripts/crystallized_*.py
+tools/versions/*.py
+!tools/versions/.gitkeep
