@@ -45,3 +45,14 @@ logs/
 # WeChat iLink tokens & temporary QR
 .context_tokens.json
 wechat_qr.png
+
+# SQLite databases & traces
+*.db
+*.db-wal
+*.db-shm
+tools/tool_execution_trace.jsonl
+*.lock
+
+# Deploy backups & credentials
+deploy/backups/
+*.disabled

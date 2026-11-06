@@ -1,0 +1,8 @@
+[
+  {
+    "id": "daily_system_health",
+    "name": "每日系统健康自检",
+    "cron": "0 8 * * *",
+    "script": "system_health_check"
+  }
+]

@@ -1,0 +1,15 @@
+[Unit]
+Description=Autonomous Multi-CLI WeChat Agent Service
+After=network.target
+
+[Service]
+Type=simple
+User=martin
+WorkingDirectory=/opt/agyWechat
+ExecStart=/opt/agyWechat/venv/bin/python3 main.py
+Restart=always
+RestartSec=5
+EnvironmentFile=/opt/agyWechat/.env
+
+[Install]
+WantedBy=multi-user.target
