@@ -6,7 +6,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 import yaml
-from pydantic import Field, field_validator
+from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -22,12 +22,18 @@ class Settings(BaseSettings):
         default="webhook",
         description="WeChat channel mode: 'webhook' or 'ilink'",
     )
-    WECHAT_TOKEN: str = Field(default="dev_token_123456", description="WeChat Webhook verification token")
+    WECHAT_TOKEN: SecretStr = Field(
+        default=SecretStr("dev_token_123456"),
+        description="WeChat Webhook verification token (masked via SecretStr)",
+    )
     WECHAT_PUSH_URL: str = Field(
         default="http://127.0.0.1:8000/mock/wechat/push",
         description="WeChat Push API endpoint",
     )
-    WECHAT_BOT_SECRET: str = Field(default="", description="WeChat Push API authentication secret")
+    WECHAT_BOT_SECRET: SecretStr = Field(
+        default=SecretStr(""),
+        description="WeChat Push API authentication secret (masked via SecretStr)",
+    )
     ALLOWED_USERS: List[str] = Field(
         default_factory=lambda: ["*"],
         description="List of allowed WeChat OpenIDs (* allows any user)",
@@ -42,9 +48,9 @@ class Settings(BaseSettings):
         default=None,
         description="Tencent iLink Bot account identifier (e.g. xxx@im.bot)",
     )
-    WEIXIN_TOKEN: Optional[str] = Field(
+    WEIXIN_TOKEN: Optional[SecretStr] = Field(
         default=None,
-        description="Tencent iLink Bot authentication token",
+        description="Tencent iLink Bot authentication token (masked via SecretStr)",
     )
     WEIXIN_BASE_URL: str = Field(
         default="https://ilinkai.weixin.qq.com",
@@ -92,6 +98,13 @@ class Settings(BaseSettings):
     # Service Bind
     SERVICE_HOST: str = Field(default="0.0.0.0", description="HTTP service host")
     SERVICE_PORT: int = Field(default=8000, description="HTTP service port")
+
+    @field_validator("WEIXIN_TOKEN", mode="before")
+    @classmethod
+    def normalize_empty_weixin_token(cls, v: Any) -> Any:
+        if isinstance(v, str) and not v.strip():
+            return None
+        return v
 
     @field_validator("ALLOWED_USERS", "ADMIN_USERS", mode="before")
     @classmethod

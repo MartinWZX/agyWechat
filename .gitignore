@@ -1,15 +1,116 @@
-# Python
+# ==========================================
+# 1. 环境变量与密钥凭证 (最高机密 - 严禁提交)
+# ==========================================
+.env
+.env.*
+!.env.example
+.envrc
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.keystore
+id_rsa*
+id_ed25519*
+*credentials*.json
+*service-account*.json
+*client_secret*.json
+.aws/
+.kube/
+.pypirc
+.npmrc
+.netrc
+
+# ==========================================
+# 2. 数据库、数据导出快照与隐私数据资产 (严禁提交)
+# ==========================================
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.sql
+*.bak
+dump.rdb
+*.csv
+*.tsv
+*.xlsx
+*.xls
+*.parquet
+*.feather
+*.pkl
+*.pickle
+*.joblib
+*.h5
+*.jsonl
+!tests/fixtures/*.jsonl
+data/raw/
+data/processed/
+exports/
+backups/
+
+# ==========================================
+# 3. AI 向量库、模型权重与运行日志 (严禁提交)
+# ==========================================
+chroma_db/
+faiss_index/
+qdrant_storage/
+milvus_data/
+lancedb/
+*.pt
+*.pth
+*.bin
+*.onnx
+*.safetensors
+*.gguf
+logs/
+*.log
+nohup.out
+npm-debug.log*
+trace_*.json
+crash_report.*
+result/
+
+# ==========================================
+# 4. AI 智能体本地会话与临时调试残留
+# ==========================================
+.cursor/
+.claude/
+.windsurf/
+.aider*
+.continue/
+.ipynb_checkpoints/
+scratch*.py
+temp*.py
+debug_*.py
+test_real_*.py
+tmp/
+
+# ==========================================
+# 5. 基础设施状态、IDE 与 Python 构建缓存
+# ==========================================
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
 .Python
-env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
 venv/
+env/
 ENV/
+dist/
 build/
 develop-eggs/
-dist/
 downloads/
 eggs/
 .eggs/
@@ -22,42 +123,22 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
-
-# Pytest & Coverage
-.pytest_cache/
-.coverage
-htmlcov/
-
-# Environment variables
-.env
-!.env.example
-
-# IDE
+.DS_Store
+Thumbs.db
 .vscode/
 .idea/
 *.swp
 *.swo
 
-# Logs
-*.log
-logs/
-
-# WeChat iLink tokens & temporary QR
+# ==========================================
+# 6. 项目专有运行态令牌、锁文件与动态演化快照
+# ==========================================
 .context_tokens.json
 wechat_qr.png
-
-# SQLite databases & traces
-*.db
-*.db-wal
-*.db-shm
 tools/tool_execution_trace.jsonl
 *.lock
-
-# Deploy backups & credentials
 deploy/backups/
 *.disabled
-
-# Runtime crystallized scripts & tool version snapshots
 skills/scripts/crystallized_*.py
 tools/versions/*.py
 !tools/versions/.gitkeep
