@@ -208,7 +208,8 @@ class ILinkPusher:
 
     async def send_raw(self, user_id: str, content: str, msg_type: str = "text") -> bool:
         """Send content chunks to the WeChat user via iLink Bot sendmessage."""
-        token = self.settings.WEIXIN_TOKEN
+        raw_token = self.settings.WEIXIN_TOKEN
+        token = raw_token.get_secret_value() if hasattr(raw_token, "get_secret_value") else raw_token
         if not token:
             logger.warning("WEIXIN_TOKEN is not configured. iLink push skipped.")
             return False
@@ -339,7 +340,8 @@ class ILinkGatewayWorker:
 
     async def _poll_loop(self) -> None:
         """Core long-polling loop for WeChat incoming messages."""
-        token = self.settings.WEIXIN_TOKEN
+        raw_token = self.settings.WEIXIN_TOKEN
+        token = raw_token.get_secret_value() if hasattr(raw_token, "get_secret_value") else raw_token
         if not token:
             logger.warning("No WEIXIN_TOKEN configured. iLink poller cannot start.")
             return

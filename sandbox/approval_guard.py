@@ -38,6 +38,10 @@ class ApprovalGuard:
         r"~/.config/gcloud",
         r"/etc/shadow",
         r"/etc/passwd",
+        r"\bgit\s+add\s+(?:-A|--all|\*|\.)(?:\s|$)",
+        r"\bgit\s+commit\s+(?:[^\n]*\s)?-(?:[a-zA-Z]*a[a-zA-Z]*|-all)\b",
+        r"\bgit\s+(?:commit|push|merge)\b[^\n]*(?:--no-verify|\s-n(?:\s|$))",
+        r"\bgit\s+push\b[^\n]*(?:--force(?:-with-lease)?|\s-f(?:\s|$))",
     ]
 
     PROHIBITED_CALLS = [
@@ -56,50 +60,67 @@ class ApprovalGuard:
 
     @classmethod
     def scan_shell_command(cls, cmd_str: str) -> Tuple[bool, str]:
-        """Scan command string against dangerous regex blacklist."""
+        """Scan command string against dangerous shell and Git redline regex blacklist."""
         for pattern in cls.DANGEROUS_COMMANDS:
             if re.search(pattern, cmd_str):
                 raise SandboxSecurityError(f"Prohibited high-risk command pattern detected: {pattern}")
         return True, "Shell command safe."
 
     @classmethod
+    def _collect_ast_violations(cls, tree: ast.AST) -> List[str]:
+        """Collect all prohibited builtin, attribute, and aliased call violations from an AST."""
+        prohibited_builtins = {"eval", "exec"}
+        prohibited_dotted = set(cls.PROHIBITED_CALLS) - prohibited_builtins
+        imported_aliases: Dict[str, str] = {}
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module:
+                for alias in node.names:
+                    bound_name = alias.asname or alias.name
+                    imported_aliases[bound_name] = f"{node.module}.{alias.name}"
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.asname:
+                        imported_aliases[alias.asname] = alias.name
+
+        violations: List[str] = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                if isinstance(node.func, ast.Name):
+                    func_name = node.func.id
+                    if func_name in prohibited_builtins:
+                        violations.append(func_name)
+                    elif imported_aliases.get(func_name) in prohibited_dotted:
+                        violations.append(imported_aliases[func_name])
+                elif isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name):
+                    root_name = imported_aliases.get(node.func.value.id, node.func.value.id)
+                    full_call = f"{root_name}.{node.func.attr}"
+                    if full_call in prohibited_dotted:
+                        violations.append(full_call)
+        return violations
+
+    @classmethod
     def scan_python_ast(cls, script_content: str) -> Tuple[bool, str]:
-        """Static AST security check for prohibited function calls."""
+        """Static AST security check enforcing 100% of PROHIBITED_CALLS."""
         try:
             tree = ast.parse(script_content)
         except SyntaxError as e:
             raise SandboxSecurityError(f"AST syntax parsing error: {e}")
 
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Call):
-                if isinstance(node.func, ast.Name) and node.func.id in ["eval"]:
-                    raise SandboxSecurityError(f"Prohibited built-in '{node.func.id}' call detected.")
-                if isinstance(node.func, ast.Attribute):
-                    val = node.func.value
-                    if isinstance(val, ast.Name) and val.id == "os" and node.func.attr == "system":
-                        raise SandboxSecurityError("Prohibited 'os.system' execution detected.")
+        violations = cls._collect_ast_violations(tree)
+        if violations:
+            raise SandboxSecurityError(f"Prohibited call detected: {violations[0]}")
         return True, "AST security scan passed."
 
     @classmethod
     def inspect_script_code(cls, script_content: str) -> Tuple[bool, List[str]]:
         """Inspect script and return boolean success and error message list."""
-        errors: List[str] = []
         try:
             tree = ast.parse(script_content)
         except SyntaxError as e:
             return False, [f"AST syntax error: {e}"]
 
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Call):
-                if isinstance(node.func, ast.Name) and node.func.id in ["eval", "exec"]:
-                    errors.append(f"Prohibited call: {node.func.id}")
-                elif isinstance(node.func, ast.Attribute):
-                    val = node.func.value
-                    if isinstance(val, ast.Name):
-                        full_call = f"{val.id}.{node.func.attr}"
-                        if full_call in cls.PROHIBITED_CALLS:
-                            errors.append(f"Prohibited call: {full_call}")
-
+        errors = [f"Prohibited call: {v}" for v in cls._collect_ast_violations(tree)]
         return (len(errors) == 0), errors
 
     @classmethod
