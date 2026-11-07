@@ -4,7 +4,7 @@
 
 ---
 
-## 📁 优化后的项目目录组织架构 (Clean Project Layout)
+## 📁 项目目录组织架构 (Project Layout)
 
 项目根目录保持高度整洁，核心功能采用领域模块化封装，非核心文件按功能归档至对应子目录：
 
@@ -15,7 +15,6 @@ agyWechat/
 ├── config.yaml                  # 生产级核心配置（CLI 路径、风控阈值、同音字表）
 ├── run.sh                       # 宿主机一键启动脚本
 ├── requirements.txt             # Python 核心依赖清单
-├── pytest.ini                   # 测试套件配置文件
 ├── .env / .env.example          # 环境配置与示例
 │
 ├── AGENTS.md                    # 跨引擎统一主控规范（防幻觉、防 429 铁律）
@@ -68,29 +67,15 @@ agyWechat/
 │   └── health_monitor.py        # 纯代码卸载率与风控看板
 ├── verifier/                    # 模块 12：全链路四维反幻觉确定性审计引擎
 │   └── hallucination_guard.py   # 物理快照差分、逻辑自洽与影子实测校验
-├── rsi/                         # 模块 13：RSI 递归自演进总控引擎
-│   └── evolution_engine.py      # 驱动 LLM-First -> Code-First 全周期生命周期演进
-└── tests/                       # 🧪 自动化测试套件
-    ├── test_code_first_system.py # 核心系统与全链路集成测试
-    ├── test_full_system.py       # 12 核心模块综合测试
-    ├── test_rsi_evolution.py     # RSI 自演进与时序 Cron 固化测试
-    ├── test_ilink_gateway.py     # 微信 iLink 协议与 Poller 测试
-    └── test_terminal_cleaner.py  # 终端 ANSI 与分片算法测试
+└── rsi/                         # 模块 13：RSI 递归自演进总控引擎
+    └── evolution_engine.py      # 驱动 LLM-First -> Code-First 全周期生命周期演进
 ```
 
 ---
 
 ## ⚡ 核心设计原则
 
-1. **根目录极致清爽**：根目录仅保留入口文件（`main.py`）、主配置文件（`config.yaml`）、环境定义（`.env`）与规范规范（`AGENTS.md`），所有辅助文件、文档、旧版代码与部署资产均归整入专用子目录。
+1. **根目录极致清爽**：根目录仅保留入口文件（`main.py`）、主配置文件（`config.yaml`）、环境定义（`.env`）与主控规范（`AGENTS.md`），所有辅助文件、文档、旧版代码与部署资产均归整入专用子目录。
 2. **纯代码卸载率 $\ge 90\%$**：常规查询与高频微信语音/文字消息经由 L0 规则拦截，100% 由本地 Python 脚本毫秒级处理，0 Token 消耗，彻底消除 429 风控与幻觉。
 3. **物理反幻觉闭环**：通过物理状态前后快照差分（Git / Hash Diff），拦截“说多做少”与“说少做多”（自动回滚越权篡改）。
 4. **单行式与常驻 PTY 双模调度**：支持 `agy`、`pi`、`claude`、`omp` 官方二进制驱动，自动注入 `--dangerously-skip-permissions` 免确认执行。
-
----
-
-## 🧪 运行测试套件
-
-```bash
-./venv/bin/pytest tests/
-```
