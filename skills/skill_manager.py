@@ -1,7 +1,9 @@
-"""Progressive 4-Level Skill Manager with Symlink Sync & Precipitation."""
+"""Progressive 4-Level Skill Manager with Out-of-Process Sandbox Execution & Symlink Sync."""
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
-from verifier.hallucination_guard import ShadowDryRunValidator, ShadowDryRunError
+
+from sandbox.runner import SandboxExecutionError, run_file_async
+from verifier.hallucination_guard import ShadowDryRunError, ShadowDryRunValidator
 
 
 class SkillManager:
@@ -24,36 +26,31 @@ class SkillManager:
         self.l2_skills_dir.mkdir(parents=True, exist_ok=True)
 
     def save_l0_script(self, filename: str, code: str) -> Path:
-        """Save a deterministic Level 0 pure-code Python script."""
+        """Validate and save a deterministic Level 0 pure-code Python script."""
+        ShadowDryRunValidator.validate_script(code)
         script_path = self.l0_scripts_dir / filename
         script_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(script_path, "w", encoding="utf-8") as f:
-            f.write(code.strip() + "\n")
+        script_path.write_text(code.strip() + "\n", encoding="utf-8")
         return script_path
 
-    async def execute_l0_script(self, script_path: Union[str, Path], **kwargs) -> Any:
-        """Execute a Level 0 script dynamically by running its 'run' function."""
+    async def execute_l0_script(self, script_path: Union[str, Path], **kwargs: Any) -> Any:
+        """Execute a Level 0 script in the isolated out-of-process sandbox via its `run` entrypoint."""
         path_obj = Path(script_path)
         if not path_obj.exists():
             raise FileNotFoundError(f"L0 script '{path_obj}' does not exist.")
 
-        with open(path_obj, "r", encoding="utf-8") as f:
-            code = f.read()
-
-        scope: Dict[str, Any] = {"__builtins__": __builtins__}
-        exec(code, scope)
-
-        run_func = scope.get("run")
-        if not run_func or not callable(run_func):
-            raise AttributeError(f"L0 script '{path_obj.name}' must define a callable 'run(**kwargs)' entrypoint.")
-
-        return run_func(**kwargs)
+        res = await run_file_async(str(path_obj), entrypoint="run", kwargs=kwargs, timeout=15.0)
+        if not res.ok:
+            raise SandboxExecutionError(
+                f"L0 script '{path_obj.name}' failed in sandbox: {res.error_summary()}"
+            )
+        return res.result
 
     def list_l0_scripts(self) -> List[str]:
         """List all Level 0 pure-code scripts in skills/scripts/."""
         if not self.l0_scripts_dir.exists():
             return []
-        return [p.name for p in self.l0_scripts_dir.glob("*.py") if p.name != "__init__.py"]
+        return sorted(p.name for p in self.l0_scripts_dir.glob("*.py") if p.name != "__init__.py")
 
     def list_l2_skills(self) -> List[Dict[str, str]]:
         """List Level 2/3 skill summaries from .agents/skills/."""
@@ -75,34 +72,25 @@ class SkillManager:
         script_code: Optional[str] = None
     ) -> Tuple[bool, str]:
         """Precipitate or upgrade a skill into .agents/skills/<skill_name>/SKILL.md."""
-        target_dir = self.l2_skills_dir / skill_name
-        target_dir.mkdir(parents=True, exist_ok=True)
-
-        md_path = target_dir / "SKILL.md"
-        with open(md_path, "w", encoding="utf-8") as f:
-            f.write(skill_md_content.strip() + "\n")
-
         if script_code:
             try:
                 ShadowDryRunValidator.validate_script(script_code)
             except ShadowDryRunError as e:
                 return False, f"Skill script dry-run failed: {e}"
+            self.save_l0_script(f"{skill_name}.py", script_code)
 
-            script_filename = f"{skill_name}.py"
-            self.save_l0_script(script_filename, script_code)
+        target_dir = self.l2_skills_dir / skill_name
+        target_dir.mkdir(parents=True, exist_ok=True)
+        md_path = target_dir / "SKILL.md"
+        md_path.write_text(skill_md_content.strip() + "\n", encoding="utf-8")
 
         return True, f"Skill '{skill_name}' successfully precipitated at version {version}."
 
-    def sync_global_agent_rules(self):
+    def sync_global_agent_rules(self) -> None:
         """Synchronize AGENTS.md rules with GEMINI.md and CLAUDE.md."""
         agents_md = self.workspace_root / "AGENTS.md"
         if not agents_md.exists():
             return
-
-        gemini_md = self.workspace_root / "GEMINI.md"
-        claude_md = self.workspace_root / "CLAUDE.md"
-
-        # Mirror contents cleanly
         content = agents_md.read_text(encoding="utf-8")
-        gemini_md.write_text(content, encoding="utf-8")
-        claude_md.write_text(content, encoding="utf-8")
+        (self.workspace_root / "GEMINI.md").write_text(content, encoding="utf-8")
+        (self.workspace_root / "CLAUDE.md").write_text(content, encoding="utf-8")

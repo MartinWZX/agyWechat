@@ -1,37 +1,140 @@
-"""Deterministic Tool Registry with Version Snapshots & Execution Trace Audit Log."""
-import os
-import json
-import time
-import shutil
+"""Deterministic Tool Registry with Sandboxed Dynamic Tools, Persistent Snapshots & Trace Audit."""
 import ast
-from typing import Callable, Dict, Any, List, Optional, Tuple
-from verifier.hallucination_guard import ShadowDryRunValidator, ShadowDryRunError
+import json
+import os
+import re
+import shutil
+import subprocess
+import time
+from contextlib import closing
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+from sandbox.approval_guard import ApprovalGuard, SandboxSecurityError
+from sandbox.runner import SandboxExecutionError, run_code_sync
+from tools.audit_tools import run_ast_contract_audit, run_git_zero_leakage_audit
+from verifier.hallucination_guard import ShadowDryRunError, ShadowDryRunValidator
+
+
+def _locate_entrypoint_in_ast(tree: ast.Module, tool_name: str) -> Optional[Tuple[str, str]]:
+    """Locate target function name and docstring in AST without executing untrusted code."""
+    funcs: Dict[str, ast.FunctionDef] = {}
+    first_name: Optional[str] = None
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and not node.name.startswith("_"):
+            funcs[node.name] = node
+            if first_name is None:
+                first_name = node.name
+    chosen = funcs.get(tool_name) or funcs.get(f"tool_{tool_name}") or (funcs.get(first_name) if first_name else None)
+    if chosen is None:
+        return None
+    doc = ast.get_docstring(chosen) or f"Dynamic sandboxed tool '{tool_name}'"
+    return chosen.name, doc
+
+
+def _make_sandboxed_tool(tool_name: str, entrypoint: str, code: str, doc: str) -> Callable:
+    """Create a host-safe callable wrapper that executes dynamic tool code out-of-process."""
+    def _runner(**kwargs: Any) -> Any:
+        res = run_code_sync(
+            code,
+            entrypoint=entrypoint,
+            kwargs=kwargs,
+            timeout=10.0,
+            allow_network=False,
+            filename=f"<tool:{tool_name}>",
+        )
+        if not res.ok:
+            raise SandboxExecutionError(f"Tool '{tool_name}' failed in sandbox: {res.error_summary()}")
+        return res.result
+
+    _runner.__name__ = entrypoint
+    _runner.__doc__ = doc
+    return _runner
 
 
 class ToolRegistry:
-    """Self-evolving deterministic tool registry with versioned rollback."""
+    """Self-evolving deterministic tool registry with persistent versioned rollback."""
     _instance = None
     _tools: Dict[str, Callable] = {}
     _tool_versions: Dict[str, int] = {}
+    _tool_dirs: Dict[str, str] = {}
     _trace_path = "tools/tool_execution_trace.jsonl"
     _versions_dir = "tools/versions"
 
-    def __new__(cls, *args, **kwargs):
+    def __new__(cls, *args: Any, **kwargs: Any) -> "ToolRegistry":
         if not cls._instance:
             cls._instance = super(ToolRegistry, cls).__new__(cls)
         return cls._instance
 
     @classmethod
-    def register(cls, name: str):
-        """Decorator to register a deterministic Python tool."""
-        def decorator(func: Callable):
+    def _manifest_path(cls, versions_dir: Optional[str] = None) -> str:
+        return os.path.join(versions_dir or cls._versions_dir, "manifest.json")
+
+    @classmethod
+    def _save_manifest(cls, active_map: Dict[str, int], versions_dir: Optional[str] = None) -> None:
+        vdir = versions_dir or cls._versions_dir
+        os.makedirs(vdir, exist_ok=True)
+        with open(cls._manifest_path(vdir), "w", encoding="utf-8") as f:
+            json.dump(active_map, f, ensure_ascii=False, indent=2, sort_keys=True)
+
+    @classmethod
+    def _load_manifest(cls, versions_dir: Optional[str] = None) -> Dict[str, int]:
+        mpath = cls._manifest_path(versions_dir)
+        if os.path.isfile(mpath):
+            try:
+                with open(mpath, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    return {str(k): int(v) for k, v in data.items() if int(v) > 0}
+            except (OSError, ValueError):
+                return {}
+        return {}
+
+    @classmethod
+    def load_persisted_tools(cls) -> int:
+        """Reload dynamically mutated tools from `tools/versions/` on process startup."""
+        if not os.path.isdir(cls._versions_dir):
+            return 0
+        manifest = cls._load_manifest()
+        if not manifest:
+            for fname in os.listdir(cls._versions_dir):
+                m = re.match(r"^([a-zA-Z0-9_]+)_v(\d+)\.py$", fname)
+                if m:
+                    tname, ver = m.group(1), int(m.group(2))
+                    if ver > manifest.get(tname, 0):
+                        manifest[tname] = ver
+        loaded = 0
+        for tool_name, version in manifest.items():
+            if tool_name in cls._tools:
+                continue
+            vpath = os.path.join(cls._versions_dir, f"{tool_name}_v{version}.py")
+            if not os.path.isfile(vpath):
+                continue
+            try:
+                with open(vpath, "r", encoding="utf-8") as f:
+                    code = f.read()
+                ApprovalGuard.scan_python_ast(code)
+                tree = ast.parse(code)
+                located = _locate_entrypoint_in_ast(tree, tool_name)
+                if located:
+                    entry, doc = located
+                    cls._tools[tool_name] = _make_sandboxed_tool(tool_name, entry, code, doc)
+                    cls._tool_versions[tool_name] = version
+                    loaded += 1
+            except (OSError, SyntaxError, SandboxSecurityError):
+                continue
+        return loaded
+
+    @classmethod
+    def register(cls, name: str) -> Callable:
+        """Decorator to register a builtin deterministic Python tool."""
+        def decorator(func: Callable) -> Callable:
             cls._tools[name] = func
             cls._tool_versions[name] = cls._tool_versions.get(name, 1)
             return func
         return decorator
 
     @classmethod
-    def set_trace_path(cls, path: str):
+    def set_trace_path(cls, path: str) -> None:
         cls._trace_path = path
 
     @classmethod
@@ -39,7 +142,7 @@ class ToolRegistry:
         return cls._tools.get(name)
 
     @classmethod
-    def execute(cls, name: str, **kwargs) -> Any:
+    def execute(cls, name: str, **kwargs: Any) -> Any:
         func = cls._tools.get(name)
         if not func:
             raise ValueError(f"Tool '{name}' not found in registry")
@@ -55,7 +158,7 @@ class ToolRegistry:
             raise
 
     @classmethod
-    def _record_trace(cls, tool_name: str, args: Dict[str, Any], result: Any, duration: float, success: bool):
+    def _record_trace(cls, tool_name: str, args: Dict[str, Any], result: Any, duration: float, success: bool) -> None:
         entry = {
             "timestamp": time.time(),
             "tool_name": tool_name,
@@ -64,7 +167,7 @@ class ToolRegistry:
             "duration": round(duration, 4),
             "result_preview": str(result)[:300]
         }
-        os.makedirs(os.path.dirname(cls._trace_path), exist_ok=True)
+        os.makedirs(os.path.dirname(cls._trace_path) or ".", exist_ok=True)
         with open(cls._trace_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
@@ -81,8 +184,9 @@ class ToolRegistry:
 
     @classmethod
     def list_tool_signatures(cls) -> List[Dict[str, str]]:
-        sigs = []
-        for name, func in cls._tools.items():
+        sigs: List[Dict[str, str]] = []
+        for name in sorted(cls._tools.keys()):
+            func = cls._tools[name]
             doc = func.__doc__ or "Deterministic Python tool"
             sigs.append({
                 "name": name,
@@ -92,79 +196,89 @@ class ToolRegistry:
         return sigs
 
     @classmethod
-    def apply_mutation_patch(cls, action: str, tool_name: str, tool_code: str) -> Tuple[bool, str]:
-        """Apply tool mutation patch with AST check, shadow dry-run, and version snapshot."""
-        # 1. AST Validation
-        try:
-            tree = ast.parse(tool_code)
-        except SyntaxError as e:
-            return False, f"Tool code AST syntax error: {e}"
+    def apply_mutation_patch(
+        cls,
+        action: str,
+        tool_name: str,
+        tool_code: str,
+        versions_dir: Optional[str] = None,
+    ) -> Tuple[bool, str]:
+        """Apply tool mutation patch with AST security scan, out-of-process dry-run, and persistent snapshot."""
+        vdir = versions_dir or cls._versions_dir
+        if action == "deprecate":
+            cls._tools.pop(tool_name, None)
+            manifest = cls._load_manifest(vdir)
+            manifest.pop(tool_name, None)
+            cls._save_manifest(manifest, vdir)
+            return True, f"Deprecated tool '{tool_name}'."
 
-        # 2. Shadow dry-run validation
+        try:
+            ApprovalGuard.scan_python_ast(tool_code)
+            tree = ast.parse(tool_code)
+        except (SyntaxError, SandboxSecurityError) as e:
+            return False, f"Tool code security/syntax error: {e}"
+
         try:
             ShadowDryRunValidator.validate_script(tool_code)
         except ShadowDryRunError as e:
             return False, f"Tool shadow dry-run failed: {e}"
 
-        # 3. Snapshot current version if updating
-        os.makedirs(cls._versions_dir, exist_ok=True)
+        located = _locate_entrypoint_in_ast(tree, tool_name)
+        if not located:
+            return False, f"Could not locate callable function for tool '{tool_name}' in code."
+        entry, doc = located
+
+        os.makedirs(vdir, exist_ok=True)
         current_v = cls._tool_versions.get(tool_name, 0)
         next_v = current_v + 1
-
-        version_path = os.path.join(cls._versions_dir, f"{tool_name}_v{next_v}.py")
+        version_path = os.path.join(vdir, f"{tool_name}_v{next_v}.py")
         with open(version_path, "w", encoding="utf-8") as f:
-            f.write(tool_code)
+            f.write(tool_code.strip() + "\n")
 
-        # 4. Dynamically compile and hot-register
-        scope: Dict[str, Any] = {}
-        exec(tool_code, scope)
-        target_func = scope.get(tool_name) or scope.get(f"tool_{tool_name}")
-        if not target_func and scope:
-            # Pick first callable function
-            for k, v in scope.items():
-                if callable(v) and not k.startswith("__"):
-                    target_func = v
-                    break
-
-        if not target_func:
-            return False, f"Could not locate callable function for tool '{tool_name}' in code."
-
-        cls._tools[tool_name] = target_func
+        cls._tools[tool_name] = _make_sandboxed_tool(tool_name, entry, tool_code, doc)
         cls._tool_versions[tool_name] = next_v
+        cls._tool_dirs[tool_name] = vdir
+        manifest = cls._load_manifest(vdir)
+        manifest[tool_name] = next_v
+        cls._save_manifest(manifest, vdir)
         return True, f"Successfully {action}ed tool '{tool_name}' to version v{next_v}."
 
     @classmethod
-    def rollback(cls, tool_name: str) -> Tuple[bool, str]:
-        """Rollback tool to previous version snapshot."""
+    def rollback(cls, tool_name: str, versions_dir: Optional[str] = None) -> Tuple[bool, str]:
+        """Rollback tool to previous persistent version snapshot."""
+        vdir = versions_dir or cls._tool_dirs.get(tool_name) or cls._versions_dir
         current_v = cls._tool_versions.get(tool_name, 1)
         if current_v <= 1:
             return False, f"No previous version available for tool '{tool_name}'."
         prev_v = current_v - 1
-        version_path = os.path.join(cls._versions_dir, f"{tool_name}_v{prev_v}.py")
+        version_path = os.path.join(vdir, f"{tool_name}_v{prev_v}.py")
         if not os.path.exists(version_path):
             return False, f"Snapshot for v{prev_v} not found at {version_path}."
 
         with open(version_path, "r", encoding="utf-8") as f:
             code = f.read()
+        try:
+            ApprovalGuard.scan_python_ast(code)
+            tree = ast.parse(code)
+        except (SyntaxError, SandboxSecurityError) as e:
+            return False, f"Failed to validate previous version: {e}"
 
-        scope: Dict[str, Any] = {}
-        exec(code, scope)
-        target_func = scope.get(tool_name) or scope.get(f"tool_{tool_name}")
-        if not target_func:
-            return False, "Failed to compile previous version."
+        located = _locate_entrypoint_in_ast(tree, tool_name)
+        if not located:
+            return False, "Failed to locate entrypoint in previous version."
+        entry, doc = located
 
-        cls._tools[tool_name] = target_func
+        cls._tools[tool_name] = _make_sandboxed_tool(tool_name, entry, code, doc)
         cls._tool_versions[tool_name] = prev_v
+        manifest = cls._load_manifest(vdir)
+        manifest[tool_name] = prev_v
+        cls._save_manifest(manifest, vdir)
         return True, f"Rolled back tool '{tool_name}' to version v{prev_v}."
 
 
-# Global registry singleton alias
 registry = ToolRegistry()
 
 
-# ==========================================
-# Pre-registered Deterministic Tools
-# ==========================================
 @ToolRegistry.register("read_file")
 def tool_read_file(path: str) -> str:
     """Read full contents of a file within the workspace."""
@@ -199,8 +313,6 @@ def tool_system_metrics() -> Dict[str, Any]:
 def tool_db_query_stats(db_path: str = "memory/agent_core.db") -> Dict[str, Any]:
     """Query statistics from local SQLite database with guaranteed connection closure."""
     import sqlite3
-    from contextlib import closing
-
     if not os.path.exists(db_path):
         return {"error": "Database file not found"}
     with closing(sqlite3.connect(db_path)) as conn:
@@ -213,128 +325,13 @@ def tool_db_query_stats(db_path: str = "memory/agent_core.db") -> Dict[str, Any]
 @ToolRegistry.register("git_zero_leakage_audit")
 def tool_git_zero_leakage_audit(workspace_dir: str = ".") -> Dict[str, Any]:
     """Audit Git staged files, notebooks, and added diff lines against zero-leakage security redlines."""
-    import re
-    import subprocess
-
-    forbidden_path_re = re.compile(
-        r"(^|/)\.env(\..+)?$|\.(pem|key|p12|pfx|crt|keystore|db|sqlite|sqlite3|sql|bak|csv|tsv|xlsx|xls|parquet|feather|pkl|pickle|joblib|h5|jsonl|pt|pth|bin|onnx|safetensors|gguf|log|tfstate|tfvars)$|(^|/)(chroma_db|faiss_index|qdrant_storage|milvus_data|lancedb|\.cursor|\.claude|\.windsurf|\.continue|\.aws|\.kube)/|(^|/)(id_rsa|id_ed25519|dump\.rdb|nohup\.out)|(^|/)(scratch|temp|debug_|test_real_)[^/]*\.py$|(?:^|/)[^/]*(?:credentials|service-account|client_secret)[^/]*\.json$"
-    )
-    secret_line_re = re.compile(
-        r"(sk-[a-zA-Z0-9]{20,}|ghp_[a-zA-Z0-9]{20,}|github_pat_[a-zA-Z0-9_]{20,}|AKIA[0-9A-Z]{16}|xoxb-[0-9A-Za-z-]{20,}|AIza[0-9A-Za-z_-]{35}|BEGIN (?:RSA|OPENSSH|EC|PRIVATE) KEY|(?:postgresql|mysql|redis|mongodb(?:\+srv)?)://[^/\s:@]+:[^/\s@]+@)"
-    )
-
-    proc_names = subprocess.run(
-        ["git", "diff", "--cached", "--name-only"],
-        cwd=workspace_dir,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    staged_files: List[str] = [
-        line.strip() for line in proc_names.stdout.splitlines() if line.strip()
-    ]
-
-    blocked_files: List[str] = []
-    uncleaned_notebooks: List[str] = []
-    for rel_path in staged_files:
-        base_name = os.path.basename(rel_path)
-        if base_name == ".env.example" or rel_path.endswith(".tfvars.example"):
-            continue
-        if rel_path.startswith("tests/fixtures/") and rel_path.endswith(".jsonl"):
-            full_fixture = os.path.join(workspace_dir, rel_path)
-            if os.path.isfile(full_fixture) and os.path.getsize(full_fixture) < 10240:
-                continue
-        if forbidden_path_re.search(rel_path):
-            blocked_files.append(rel_path)
-        if rel_path.endswith(".ipynb"):
-            nb_full = os.path.join(workspace_dir, rel_path)
-            if os.path.isfile(nb_full):
-                try:
-                    with open(nb_full, "r", encoding="utf-8") as nb_f:
-                        nb_data = json.load(nb_f)
-                    for cell in nb_data.get("cells", []):
-                        if cell.get("outputs") or cell.get("execution_count") is not None:
-                            uncleaned_notebooks.append(rel_path)
-                            break
-                except (OSError, ValueError):
-                    uncleaned_notebooks.append(rel_path)
-
-    proc_diff = subprocess.run(
-        ["git", "diff", "--cached", "--unified=0"],
-        cwd=workspace_dir,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    secret_hit_lines: List[str] = []
-    for idx, line in enumerate(proc_diff.stdout.splitlines(), start=1):
-        if line.startswith("+") and not line.startswith("+++"):
-            if secret_line_re.search(line):
-                secret_hit_lines.append(f"diff_line_{idx}")
-
-    passed = (
-        len(blocked_files) == 0
-        and len(uncleaned_notebooks) == 0
-        and len(secret_hit_lines) == 0
-    )
-    return {
-        "passed": passed,
-        "staged_files": staged_files,
-        "blocked_files": blocked_files,
-        "uncleaned_notebooks": uncleaned_notebooks,
-        "secret_hit_lines": secret_hit_lines,
-    }
+    return run_git_zero_leakage_audit(workspace_dir=workspace_dir)
 
 
 @ToolRegistry.register("ast_contract_audit")
 def tool_ast_contract_audit(paths: List[str]) -> Dict[str, Any]:
     """Audit Python files via AST for stubs, mutable defaults, silent excepts, and async blocking calls."""
-    violations: List[str] = []
-    mutable_types = (ast.List, ast.Dict, ast.Set)
-    blocking_http_methods = {"get", "post", "put", "delete", "patch", "head", "options", "request"}
+    return run_ast_contract_audit(paths=paths)
 
-    for file_path in paths:
-        if not os.path.isfile(file_path) or not file_path.endswith(".py"):
-            continue
-        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-            source = f.read()
-        try:
-            tree = ast.parse(source, filename=file_path)
-        except SyntaxError as e:
-            violations.append(f"{file_path}:{e.lineno}:syntax_error")
-            continue
 
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Pass):
-                violations.append(f"{file_path}:{node.lineno}:prohibited_pass_stub")
-            elif isinstance(node, ast.Constant) and node.value is Ellipsis:
-                violations.append(f"{file_path}:{node.lineno}:prohibited_ellipsis_stub")
-            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                all_defaults = list(node.args.defaults) + [
-                    d for d in node.args.kw_defaults if d is not None
-                ]
-                for default_node in all_defaults:
-                    if isinstance(default_node, mutable_types):
-                        violations.append(f"{file_path}:{node.lineno}:mutable_default_arg:{node.name}")
-                if isinstance(node, ast.AsyncFunctionDef):
-                    for child in ast.walk(node):
-                        if isinstance(child, ast.Call) and isinstance(child.func, ast.Attribute):
-                            if isinstance(child.func.value, ast.Name):
-                                mod_name = child.func.value.id
-                                attr_name = child.func.attr
-                                if mod_name == "time" and attr_name == "sleep":
-                                    violations.append(
-                                        f"{file_path}:{child.lineno}:sync_sleep_in_async:{node.name}"
-                                    )
-                                elif mod_name == "requests" and attr_name in blocking_http_methods:
-                                    violations.append(
-                                        f"{file_path}:{child.lineno}:sync_requests_in_async:{node.name}"
-                                    )
-            elif isinstance(node, ast.ExceptHandler):
-                if len(node.body) == 1 and isinstance(node.body[0], ast.Return):
-                    ret_val = node.body[0].value
-                    if ret_val is None or (isinstance(ret_val, ast.Constant) and ret_val.value is None):
-                        violations.append(f"{file_path}:{node.lineno}:silent_exception_return_none")
-
-    return {"passed": len(violations) == 0, "violations": violations}
-
+ToolRegistry.load_persisted_tools()

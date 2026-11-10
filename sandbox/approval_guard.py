@@ -5,7 +5,33 @@ import os
 import re
 import time
 from enum import IntEnum
-from typing import Any, Dict, List, Tuple, Union
+from typing import Any, Dict, Iterable, List, Tuple, Union
+
+
+SENSITIVE_ENV_EXACT = {"SSH_AUTH_SOCK", "GITHUB_TOKEN", "GH_TOKEN", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"}
+SENSITIVE_ENV_PREFIXES = ("AWS_", "WEIXIN_", "WECHAT_", "GITHUB_", "GH_")
+SENSITIVE_ENV_MARKERS = ("_API_KEY", "_TOKEN", "_SECRET", "_PASSWORD", "_PRIVATE_KEY")
+
+
+def scrub_environment(passthrough: Iterable[str] = ()) -> Dict[str, str]:
+    """Return a copy of os.environ with host credentials removed.
+
+    `passthrough` lists variable names an engine explicitly needs (configured per engine in
+    config.yaml `engines.<id>.env_passthrough`, e.g. ANTHROPIC_API_KEY for API-key auth).
+    """
+    keep = {name.strip() for name in passthrough if name and name.strip()}
+    scrubbed: Dict[str, str] = {}
+    for key, value in os.environ.items():
+        upper = key.upper()
+        sensitive = (
+            upper in SENSITIVE_ENV_EXACT
+            or upper.startswith(SENSITIVE_ENV_PREFIXES)
+            or any(marker in upper for marker in SENSITIVE_ENV_MARKERS)
+        )
+        if sensitive and key not in keep:
+            continue
+        scrubbed[key] = value
+    return scrubbed
 
 
 class SandboxSecurityError(Exception):
@@ -46,9 +72,15 @@ class ApprovalGuard:
 
     PROHIBITED_CALLS = [
         "os.system",
+        "os.popen",
+        "os.fork",
+        "os.execv",
+        "os.execvp",
+        "os.execve",
         "subprocess.Popen",
         "eval",
         "exec",
+        "__import__",
         "shutil.rmtree",
     ]
 
@@ -69,7 +101,7 @@ class ApprovalGuard:
     @classmethod
     def _collect_ast_violations(cls, tree: ast.AST) -> List[str]:
         """Collect all prohibited builtin, attribute, and aliased call violations from an AST."""
-        prohibited_builtins = {"eval", "exec"}
+        prohibited_builtins = {"eval", "exec", "__import__"}
         prohibited_dotted = set(cls.PROHIBITED_CALLS) - prohibited_builtins
         imported_aliases: Dict[str, str] = {}
 
@@ -137,17 +169,9 @@ class ApprovalGuard:
             return PermissionLevel.L2_LOCAL_WRITE.value
         return PermissionLevel.L1_READ.value
 
-    def get_scrubbed_env(self) -> Dict[str, str]:
+    def get_scrubbed_env(self, passthrough: Iterable[str] = ()) -> Dict[str, str]:
         """Strip sensitive host credentials before launching subprocess."""
-        scrubbed = os.environ.copy()
-        blacklist = [
-            "AWS_SECRET_ACCESS_KEY", "AWS_ACCESS_KEY_ID",
-            "OPENAI_API_KEY", "ANTHROPIC_API_KEY",
-            "GITHUB_TOKEN", "SSH_AUTH_SOCK"
-        ]
-        for key in blacklist:
-            scrubbed.pop(key, None)
-        return scrubbed
+        return scrub_environment(passthrough)
 
     async def request_permission(
         self,
@@ -183,7 +207,7 @@ class ApprovalGuard:
 
     async def handle_approval_response(self, user_id: str, message_content: str) -> str:
         """Handle administrator approval message (e.g. '确认 <action_id>')."""
-        admin_users = getattr(self.settings, "ADMIN_USERS", ["admin_user", "*"])
+        admin_users = getattr(self.settings, "ADMIN_USERS", None) or []
         if "*" not in admin_users and user_id not in admin_users:
             return f"权限不足：用户 '{user_id}' 不是管理员，无法审批高危操作。"
 

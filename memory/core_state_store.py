@@ -4,6 +4,7 @@ import sqlite3
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Tuple, Union
+from memory.sqlite_utils import connect as sqlite_connect
 
 
 class CoreStateStore:
@@ -15,11 +16,17 @@ class CoreStateStore:
         self._init_db()
 
     def _get_connection(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path, timeout=30.0)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL;")
-        conn.execute("PRAGMA synchronous=NORMAL;")
-        return conn
+        """Open a self-closing WAL connection (see memory/sqlite_utils.ClosingConnection)."""
+        return sqlite_connect(self.db_path, timeout=30.0)
+
+    @staticmethod
+    def _ensure_columns(cursor: sqlite3.Cursor, table: str, columns: Dict[str, str]) -> None:
+        """Idempotent additive schema migration (ALTER TABLE ADD COLUMN for missing columns)."""
+        cursor.execute(f"PRAGMA table_info({table});")
+        existing = {row[1] for row in cursor.fetchall()}
+        for col_name, col_def in columns.items():
+            if col_name not in existing:
+                cursor.execute(f"ALTER TABLE {table} ADD COLUMN {col_name} {col_def};")
 
     def _init_db(self):
         with self._get_connection() as conn:
@@ -156,6 +163,27 @@ class CoreStateStore:
                 created_at REAL
             );""")
 
+            # 7. Additive migrations for legacy schemas & governed RSI lifecycle
+            self._ensure_columns(cursor, "messages", {
+                "msg_type": "TEXT DEFAULT 'text'", "raw_content": "TEXT DEFAULT ''",
+                "normalized_content": "TEXT DEFAULT ''", "is_voice": "INTEGER DEFAULT 0",
+                "reply_content": "TEXT DEFAULT ''", "engine_used": "TEXT DEFAULT 'UNKNOWN'",
+                "offloaded": "INTEGER DEFAULT 0",
+            })
+            self._ensure_columns(cursor, "crystallized_rules", {
+                "status": "TEXT DEFAULT 'candidate'",
+                "fingerprint": "TEXT DEFAULT ''",
+                "fingerprint_hash": "TEXT DEFAULT ''",
+                "response_template": "TEXT DEFAULT ''",
+                "fail_count": "INTEGER DEFAULT 0",
+                "source": "TEXT DEFAULT 'auto'",
+                "updated_at": "REAL DEFAULT 0",
+            })
+            self._ensure_columns(cursor, "interaction_patterns", {
+                "answers_json": "TEXT DEFAULT '[]'",
+                "cron_proposed": "INTEGER DEFAULT 0",
+            })
+
             for engine in ["agy", "pi", "claude", "omp"]:
                 cursor.execute("""
                 INSERT OR IGNORE INTO engine_health_states (engine_id, state, cooldown_until, last_call_timestamp, total_calls_today, failover_count)
@@ -256,10 +284,23 @@ class CoreStateStore:
             return c5m, c1h, time_since
 
     async def get_active_rules(self) -> List[Dict[str, Any]]:
+        """Return all non-retired crystallized rules (active + staged candidates)."""
         with self._get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT * FROM crystallized_rules ORDER BY id DESC;")
+            cursor.execute("SELECT * FROM crystallized_rules WHERE status != 'retired' ORDER BY id DESC;")
             return [dict(r) for r in cursor.fetchall()]
+
+    def get_recent_exchanges(self, user_id: str, limit: int = 3) -> List[Dict[str, str]]:
+        """Return the last `limit` (question, answer) pairs for a user, oldest first."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT normalized_content, reply_content FROM messages "
+                "WHERE user_id = ? AND reply_content != '' ORDER BY created_at DESC LIMIT ?;",
+                (user_id, limit)
+            )
+            rows = cursor.fetchall()
+        return [{"q": r["normalized_content"] or "", "a": r["reply_content"] or ""} for r in reversed(rows)]
 
     def close(self):
         """No-op or cleanup for connection pool."""

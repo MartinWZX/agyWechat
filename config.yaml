@@ -16,6 +16,8 @@ system:
 
 engines:
   primary: "agy"
+  max_concurrency: 2
+  adaptive_routing: true
   failover_order:
     - "agy"
     - "pi"

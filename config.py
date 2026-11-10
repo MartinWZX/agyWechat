@@ -5,6 +5,7 @@ import os
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
 import yaml
 from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -26,6 +27,10 @@ class Settings(BaseSettings):
         default=SecretStr("dev_token_123456"),
         description="WeChat Webhook verification token (masked via SecretStr)",
     )
+    WEBHOOK_REQUIRE_SIGNATURE: bool = Field(
+        default=False,
+        description="Strictly require WeChat SHA-1 signature verification on /wechat/webhook",
+    )
     WECHAT_PUSH_URL: str = Field(
         default="http://127.0.0.1:8000/mock/wechat/push",
         description="WeChat Push API endpoint",
@@ -39,8 +44,8 @@ class Settings(BaseSettings):
         description="List of allowed WeChat OpenIDs (* allows any user)",
     )
     ADMIN_USERS: List[str] = Field(
-        default_factory=lambda: ["*"],
-        description="List of admin WeChat user IDs for approval and wind control unlock",
+        default_factory=lambda: ["admin_user"],
+        description="Explicit admin WeChat user IDs for L4/L5 approval and wind control unlock (never wildcard by default)",
     )
 
     # Tencent iLink Bot (Personal WeChat direct login) configuration
@@ -67,11 +72,11 @@ class Settings(BaseSettings):
         description="Absolute path or command name of the native Google agy binary",
     )
     AGY_LOCK_FILE: Path = Field(
-        default_factory=lambda: Path.home() / ".agent_core" / "agy_host.lock",
+        default=Path("/tmp/agent_core/locks/agy_host.lock"),
         description="OS file lock to guarantee single persistent agy host process",
     )
     DB_PATH: Path = Field(
-        default_factory=lambda: Path.home() / ".agent_core" / "core_state.db",
+        default=Path("memory/agent_core.db"),
         description="SQLite database path for state, memory, rules and wind control",
     )
 
@@ -106,22 +111,33 @@ class Settings(BaseSettings):
             return None
         return v
 
-    @field_validator("ALLOWED_USERS", "ADMIN_USERS", mode="before")
+    @field_validator("ALLOWED_USERS", mode="before")
     @classmethod
-    def parse_user_list(cls, v: Any) -> List[str]:
-        if isinstance(v, list):
-            return v
-        if isinstance(v, str):
-            v = v.strip()
-            if not v:
-                return ["*"]
-            if v.startswith("[") and v.endswith("]"):
-                try:
-                    return json.loads(v)
-                except Exception:
-                    return [item.strip() for item in v.split(",") if item.strip()]
-            return [item.strip() for item in v.split(",") if item.strip()]
-        return ["*"]
+    def parse_allowed_users(cls, v: Any) -> List[str]:
+        return _parse_str_list(v, default=["*"])
+
+    @field_validator("ADMIN_USERS", mode="before")
+    @classmethod
+    def parse_admin_users(cls, v: Any) -> List[str]:
+        return _parse_str_list(v, default=["admin_user"])
+
+
+def _parse_str_list(v: Any, default: List[str]) -> List[str]:
+    if isinstance(v, list):
+        return v
+    if isinstance(v, str):
+        v = v.strip()
+        if not v:
+            return list(default)
+        if v.startswith("[") and v.endswith("]"):
+            try:
+                parsed = json.loads(v)
+                if isinstance(parsed, list):
+                    return [str(item).strip() for item in parsed if str(item).strip()]
+            except ValueError:
+                return [item.strip() for item in v.split(",") if item.strip()]
+        return [item.strip() for item in v.split(",") if item.strip()]
+    return list(default)
 
 
 @lru_cache()

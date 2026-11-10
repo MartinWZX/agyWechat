@@ -1,7 +1,7 @@
 # Code-First Multi-CLI Agent 架构设计与系统规格白皮书
 
 > **系统名称**：WeChat Multi-CLI Agent RSI Architecture (`agyWechat`)  
-> **版本**：v2.0.0 (Production Verified) | **核心理念**：LLM-First, Code-Last → Code-First, LLM-Last (RSI 递归自我演进)  
+> **版本**：v3.0.0 (Governed RSI & Out-of-Process Sandbox Verified) | **核心理念**：LLM-First, Code-Last → Code-First, LLM-Last (受评估的递归自我演进)  
 > **底层驱动**：Google Antigravity (`agy`) / Pi Agent (`pi`) / Claude Code (`claude`) / Oh-My-Pi (`omp`)
 
 ---
@@ -136,19 +136,19 @@ $$\lim_{t \to \infty} P(\text{LLM Call}) = 0$$
 
 | 模块编号 | 模块职责与定位 | 核心文件与路径 | 关键类与函数 | 核心设计参数与指标 |
 |---------|---------------|---------------|-------------|-------------------|
-| **Module 1** | 微信双网关、原生语音识别与终端净化 | `gateway/ilink_gateway.py`<br>`gateway/wechat_gateway.py`<br>`gateway/voice_normalizer.py`<br>`gateway/terminal_cleaner.py` | `ILinkGatewayWorker`<br>`WeChatGateway`<br>`VoiceTextNormalizer`<br>`ANSICleaner` | iLink 长轮询 35s 超时；Webhook 100ms 快速 ACK；VT100 控制符清洗；拼音纠错准确率 > 98% |
-| **Module 2** | L0 认知语义网关与意图过滤 | `compressor/cognitive_gate.py` | `PreFlightGate`<br>`PreInferenceDataValidator`<br>`ContextCompressor`<br>`CognitiveGate` | 确定性前置拦截（#状态/#风控/#帮助）；上下文压缩率 > 70%；零虚构事实锚点绑定 |
-| **Module 3** | 多智能体 CLI 驱动底座 | `bridge/multi_cli_hub.py`<br>`bridge/agy_pty_bridge.py`<br>`bridge/drivers/*.py` | `MultiCLIHub`<br>`AgyPTYBridge`<br>`AgyDriver`, `PiDriver`, `ClaudeDriver`, `OmpDriver` | 统一抽象 `BaseCLIAgentDriver`；全量注入免确认标志；支持 Subprocess 与 PTY 双模 |
-| **Module 4** | 受控子智能体并发池 | `bridge/multi_cli_hub.py` | `execute_task` 并发调度 | 最大并发子智能体 $\le 2$；工作区强制 `branch` 隔离；限定 `flash`/`haiku` 模型；步数 $\le 3$ |
+| **Module 1** | 微信双网关、签名幂等、原生语音识别与终端净化 | `gateway/ilink_client.py`<br>`gateway/ilink_gateway.py`<br>`gateway/wechat_gateway.py`<br>`gateway/voice_normalizer.py`<br>`gateway/terminal_cleaner.py` | `ILinkAPIClient`, `ILinkGatewayWorker`<br>`WeChatGateway`<br>`VoiceTextNormalizer`<br>`ANSICleaner` | 单一无死锁异步管线 `handle_message`；SHA-1 签名校验与 `msg_id` 幂等；VT100 控制符清洗 |
+| **Module 2** | 四级确定性路由 DAG 与认知上下文组装 | `router/pipeline.py`<br>`compressor/cognitive_gate.py` | `DeterministicRouter`<br>`SemanticCache`<br>`CognitiveGate` | T0 指令表 → T1 已验证 RSI 技能 → T2 语义缓存 → T3 认知调度；会话窗口 + FTS5 记忆召回注入 |
+| **Module 3** | 多智能体 CLI 驱动底座与上下文锚定错误分类 | `bridge/multi_cli_hub.py`<br>`bridge/error_classifier.py`<br>`bridge/agy_pty_bridge.py`<br>`bridge/drivers/*.py` | `MultiCLIHub`<br>`classify_cli_failure`<br>`AgyPTYBridge`<br>`BaseCLIAgentDriver` | 配置化注入；上下文锚定 429/403 分类（杜绝数字子串误熔断）；EWMA 健康路由 |
+| **Module 4** | 受控优先级并发槽池 | `bridge/multi_cli_hub.py` | `_PrioritySlotGate`<br>`execute_task` | 硬上限并发 $\le 2$（`P0 > P1 > P2` 优先级队列）；快照互斥防并发污染 |
 | **Module 5** | 五维一体反风控状态机 | `guard/wind_control_governor.py` | `WindControlGovernor`<br>`CircuitState` | 5m $\le 6$ 次，1h $\le 30$ 次；间隔 $\ge 12$s；抖动 $1.5 \sim 4.8$s；429 退避 `[120, 600, 1800]`s；403 锁定 24h |
-| **Module 6** | 高频意图指纹与规则固化 | `crystallizer/pattern_crystallizer.py` | `PatternCrystallizer` | 指纹骨架提取；频次 $N \ge 3$ 自动触发固化；生成 `crystallized_<hash>.py` |
-| **Module 7** | 两阶段纯代码 Cron 调度器 | `scheduler/code_first_cron.py`<br>`scheduler/jobs.json` | `CodeFirstCronScheduler`<br>`RequireCognitiveCLI` | Stage-1 纯代码秒级巡检（0 Token）；发生异常时按需唤醒 Stage-2 认知决策 |
-| **Module 8** | 动态工具列表与版本演进 | `tools/tool_registry.py`<br>`tools/versions/` | `ToolRegistry` | 动态编译热重载；AST 语法校验；影子沙盒空跑；自动保留历史快照与毫秒级回滚 |
-| **Module 9** | 四级递进式技能管理体系 | `skills/skill_manager.py`<br>`skills/scripts/`<br>`.agents/skills/` | `SkillManager` | L0 确定性脚本、L1 模板、L2 复合技能、L3 元架构；全局规则软链接自动同步 |
-| **Module 10** | 外置沙盒安全补偿守卫 | `sandbox/approval_guard.py` | `ApprovalGuard`<br>`SandboxSecurityError`<br>`PermissionLevel` | 环境变量敏感词剥离；路径黑白名单；危险命令正则黑名单；高危函数 AST 硬拦截 |
-| **Module 11** | 四维反幻觉物理校验闭环 | `verifier/hallucination_guard.py` | `WorkspaceSnapshotDiffer`<br>`LogicalConsistencyVerifier`<br>`ShadowDryRunValidator` | SHA-256 全量快照比对；说多做少/说少做多物理判定；未声明修改物理自动回滚 |
-| **Module 12** | 核心记忆状态与全文检索中心 | `memory/core_state_store.py`<br>`memory/agent_core.db` | `CoreStateStore` | SQLite WAL 模式单写多读；FTS5 BM25 全文检索；会话、消息、风控、幻觉审计持久化 |
-| **Module 13** | RSI 递归自演进生命周期引擎 | `rsi/evolution_engine.py` | `LifecyclePhaseController`<br>`EvolutionEngine`<br>`EvolutionStage` | 成熟度评分公式计算；三阶段动态演进（Exploration $< 0.4$，Co-Evolution $0.4 \sim 0.8$，Convergence $\ge 0.8$） |
+| **Module 6** | 受评估的高频意图固化与槽位提取 | `crystallizer/pattern_crystallizer.py`<br>`rsi/eval_harness.py` | `PatternCrystallizer`<br>`EvalHarness` | 结构化槽位提取；`candidate -> EvalHarness -> active -> degraded` 治理闭环；用户负反馈秒级降级 |
+| **Module 7** | 标准 5 段 Cron 解析与两阶段纯代码调度 | `scheduler/cron_expr.py`<br>`scheduler/code_first_cron.py`<br>`scheduler/jobs.json` | `cron_is_due`<br>`CodeFirstCronScheduler`<br>`RequireCognitiveCLI` | 纯标准库 5 段 Cron 精确匹配与分钟级去重；Stage-1 进程外沙盒巡检；失败自动触发自愈 |
+| **Module 8** | 持久化沙盒工具注册中心与 MCP 服务 | `tools/tool_registry.py`<br>`tools/mcp_server.py`<br>`tools/versions/manifest.json` | `ToolRegistry`<br>`MCPToolServer` | 动态工具进程外沙盒隔离运行；`manifest.json` 重启自动恢复与版本回滚；JSON-RPC 2.0 MCP Stdio 接口 |
+| **Module 9** | 四级递进式技能管理体系 | `skills/skill_manager.py`<br>`skills/scripts/`<br>`.agents/skills/` | `SkillManager` | L0 脚本统一经进程外沙盒 `run_file_async` 执行；L2/L3 技能沉淀；全局规则同步 |
+| **Module 10** | 外置沙盒守卫与进程外隔离执行器 | `sandbox/approval_guard.py`<br>`sandbox/runner.py` | `ApprovalGuard`<br>`run_code_sync`, `run_file_async`<br>`scrub_environment` | 主进程零 `exec`；`bubblewrap` 只读根文件系统 + 禁网 + 凭证目录遮蔽 + POSIX `rlimit`；子进程环境变量清洗 |
+| **Module 11** | 四维反幻觉物理校验闭环 | `verifier/hallucination_guard.py` | `WorkspaceSnapshotDiffer`<br>`LogicalConsistencyVerifier`<br>`ShadowDryRunValidator` | 流式 SHA-256 快照与 AST 桩代码检测；契约缺失强拦截；双向极性与数值阈值一致性校验 |
+| **Module 12** | 零泄漏连接管理、核心记忆与 RSI 仓储层 | `memory/sqlite_utils.py`<br>`memory/core_state_store.py`<br>`memory/rsi_repository.py` | `ClosingConnection`<br>`CoreStateStore`<br>`RSIRepository` | 上下文退出自动关闭 FD（零句柄泄漏）；增量幂等 Schema 迁移；WAL + FTS5；禁止跨层裸写 SQL |
+| **Module 13** | RSI 递归自演进生命周期与自愈引擎 | `rsi/evolution_engine.py`<br>`rsi/eval_harness.py` | `LifecyclePhaseController`<br>`StageRoutingPolicy`<br>`EvolutionEngine` | 成熟度评分实时映射 `StageRoutingPolicy`（动态控制技能/缓存阈值与日预算）；异常脚本自动自愈与验证恢复 |
 
 ---
 
@@ -312,8 +312,9 @@ agyWechat/
 | **免确认执行安全性** | 内层放权，外层沙盒阻断 `rm -rf /`、`/etc/passwd` 等高危项 | `sandbox/approval_guard.py` | `test_sandbox_blocked_commands` (PASSED) |
 | **物理反幻觉校验** | SHA-256 全量快照比对，严禁占位符，未声明自动回滚 | `verifier/hallucination_guard.py` | `test_snapshot_differ_under_execution` (PASSED) |
 | **微信原生语音识别** | 优先直提 `Recognition`，拼音同音纠错准确率 > 98% | `gateway/voice_normalizer.py` | `test_voice_normalizer_homophones` (PASSED) |
-| **RSI 规则与 Cron 固化**| $N \ge 3$ 自动固化规则，$CV \le 0.25$ 自动沉淀 Cron | `crystallizer/pattern_crystallizer.py` | `test_pattern_crystallization_auto_rule` (PASSED) |
-| **全量回归测试** | 13 个功能模块，44 项核心用例通过率 100% (< 1.0s) | `./venv/bin/pytest tests/` | **44 passed in 0.83s** |
+| **RSI 治理闭环与自愈** | $N \ge 3$ + 答案一致性通过 `EvalHarness` 方可激活；负反馈立即降级；异常脚本自动自愈 | `crystallizer/pattern_crystallizer.py` / `rsi/eval_harness.py` / `router/pipeline.py` | `test_p1_governed_rsi_closed_loop_negative_feedback_and_self_healing` (PASSED) |
+| **进程外沙盒与防误熔断** | 主进程零 `exec`（`bwrap` 只读隔离）；429/403 上下文锚定分类；并发槽 $\le 2$ | `sandbox/runner.py` / `bridge/error_classifier.py` / `bridge/multi_cli_hub.py` | `test_architecture_v3_upgrades.py` (PASSED) |
+| **全量回归测试** | 全部生产模块单文件 $\le 400$ 行、AST 契约零违规、60 项端到端与单元测试 100% 通过 | `./venv/bin/pytest tests/` | **60 passed** |
 
 ---
 > **结论**：本白皮书与物理代码库实现保持 100% 的字符级严谨对齐，杜绝任何参数偏离或口嗨虚构。

@@ -6,6 +6,7 @@ import sqlite3
 import time
 from enum import Enum
 from typing import Any, Dict, Optional, Tuple
+from memory.sqlite_utils import connect as sqlite_connect
 
 
 class CircuitState(str, Enum):
@@ -38,6 +39,10 @@ class WindControlGovernor:
         else:
             self.db_path = "memory/agent_core.db"
             self.store = None
+
+        if self.store is None:
+            from memory.core_state_store import CoreStateStore
+            self.store = CoreStateStore(self.db_path)
 
         # Resolve Config & Settings
         self.settings = None
@@ -75,9 +80,8 @@ class WindControlGovernor:
         self._backoff_index: Dict[str, int] = {}
 
     def _get_conn(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path, timeout=30.0)
-        conn.row_factory = sqlite3.Row
-        return conn
+        # ClosingConnection guarantees the FD is released when the `with` block exits.
+        return sqlite_connect(self.db_path, timeout=30.0)
 
     def is_quiet_hours(self) -> bool:
         if not self.quiet_hours_enabled:

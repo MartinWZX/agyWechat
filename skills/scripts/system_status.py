@@ -38,5 +38,10 @@ def run_status() -> str:
 
     return f"【系统运行状态】\nCPU负载(1/5/15m): {cpu_load}\n内存占用: {mem_percent}\n根分区磁盘: {disk_percent}\n运行状态: 正常运行 (0 Token)"
 
+
+def run(**kwargs) -> str:
+    return run_status()
+
+
 if __name__ == "__main__":
     print(run_status())

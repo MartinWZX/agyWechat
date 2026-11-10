@@ -1,9 +1,9 @@
-"""Cognitive Gate, Pre-Flight Provenance Sanity Gate & Context Compressor."""
+"""Cognitive Gate, Pre-Flight Provenance Sanity Gate & Context Builder/Compressor."""
 import hashlib
 import json
 import re
 from enum import Enum
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 
 class InvocationReason(str, Enum):
@@ -20,7 +20,8 @@ class PreFlightGate:
         "#状态", "状态", "查看状态", "系统状态",
         "#风控看板", "风控看板", "#风控",
         "#幻觉审计", "幻觉审计",
-        "#help", "帮助", "使用说明"
+        "#规则", "#演进看板",
+        "#help", "帮助", "使用说明",
     ]
 
     @classmethod
@@ -28,7 +29,7 @@ class PreFlightGate:
         cls,
         reason: InvocationReason,
         user_query: str,
-        data_payload: Optional[Dict[str, Any]] = None
+        data_payload: Optional[Dict[str, Any]] = None,
     ) -> Tuple[bool, str]:
         """Validate if task genuinely requires cognitive reasoning or is strictly deterministic."""
         clean_query = user_query.strip()
@@ -73,86 +74,88 @@ class ContextCompressor:
         reason: InvocationReason,
         task_instruction: str,
         data_payload: Dict[str, Any],
-        tools_summary: Optional[str] = None
+        tools_summary: Optional[str] = None,
     ) -> str:
-        anchor_data = {}
-        for idx, (k, v) in enumerate(data_payload.items(), 1):
-            anchor_data[f"ANCHOR_{idx}_{k}"] = v
-
+        anchor_data = {f"ANCHOR_{idx}_{k}": v for idx, (k, v) in enumerate(data_payload.items(), 1)}
         manifest_json = json.dumps(anchor_data, ensure_ascii=False, indent=2)
-
-        prompt = f"""[TASK_REASON: {reason.value}]
-
-[TASK_INSTRUCTION]
-{task_instruction.strip()}
-
-[DATA_ANCHOR_MANIFEST]
-{manifest_json}
-
-[AVAILABLE_TOOLS]
-{tools_summary or "Standard deterministic tools: read_file, write_file, system_metrics"}
-
-[MANDATORY_OUTPUT_CONTRACT]
-You MUST respond using strictly the following 4 tags:
-<facts_anchor>
-(List exact ANCHOR_ID and raw values cited)
-</facts_anchor>
-<causal_chain>
-(Step-by-step logic citing ANCHOR_IDs without contradiction)
-</causal_chain>
-<execution_manifest>
-{{"files_created": [], "files_modified": [], "commands_executed": []}}
-</execution_manifest>
-<final_conclusion>
-(User-facing concise summary)
-</final_conclusion>
-
-[RSI_AUTO_CRYSTALLIZATION]
-If this task represents a recurring query or routine data check, append:
-<crystallize_script name="..." trigger_regex="..." voice_homophones="...">
-# 100% deterministic Python code with run() entrypoint
-</crystallize_script>
-"""
-        return prompt
+        return (
+            f"[TASK_REASON: {reason.value}]\n\n"
+            f"[TASK_INSTRUCTION]\n{task_instruction.strip()}\n\n"
+            f"[DATA_ANCHOR_MANIFEST]\n{manifest_json}\n\n"
+            f"[AVAILABLE_TOOLS]\n"
+            f"{tools_summary or 'Standard deterministic tools: read_file, write_file, system_metrics'}\n\n"
+            f"[MANDATORY_OUTPUT_CONTRACT]\n"
+            f"You MUST respond using strictly the following 4 tags:\n"
+            f"<facts_anchor>\n(List exact ANCHOR_ID and raw values cited)\n</facts_anchor>\n"
+            f"<causal_chain>\n(Step-by-step logic citing ANCHOR_IDs without contradiction)\n</causal_chain>\n"
+            f"<execution_manifest>\n"
+            f'{{"files_created": [], "files_modified": [], "commands_executed": []}}\n'
+            f"</execution_manifest>\n"
+            f"<final_conclusion>\n(User-facing concise summary)\n</final_conclusion>\n\n"
+            f"[RSI_AUTO_CRYSTALLIZATION]\n"
+            f"If this task represents a recurring query or routine data check, append:\n"
+            f'<crystallize_script name="..." trigger_regex="..." voice_homophones="...">\n'
+            f"# 100% deterministic Python code with run() entrypoint\n"
+            f"</crystallize_script>\n"
+        )
 
 
 class CognitiveGate:
-    """Unified gate providing anchor manifest creation and context compression."""
+    """Unified gate providing anchor manifest creation, memory injection, and context compression."""
 
     def __init__(self, data_validator: Optional[PreInferenceDataValidator] = None):
         self.validator = data_validator or PreInferenceDataValidator()
 
     def build_anchor_manifest(self, raw_data_items: Dict[str, Any]) -> Dict[str, Any]:
-        manifest = {"anchors": {}, "manifest_hash": ""}
+        manifest: Dict[str, Any] = {"anchors": {}, "manifest_hash": ""}
         combined_str = ""
         for idx, (k, v) in enumerate(raw_data_items.items(), 1):
             anchor_id = f"ANCHOR_{idx}_{k}"
             manifest["anchors"][anchor_id] = v
-            combined_str += f"{anchor_id}:{json.dumps(v, sort_keys=True)};"
+            combined_str += f"{anchor_id}:{json.dumps(v, sort_keys=True, ensure_ascii=False)};"
         manifest["manifest_hash"] = hashlib.sha256(combined_str.encode("utf-8")).hexdigest()
         return manifest
 
-    def compress_context(self, task_instruction: str, manifest: Dict[str, Any]) -> str:
+    def compress_context(
+        self,
+        task_instruction: str,
+        manifest: Dict[str, Any],
+        session_history: Optional[List[Dict[str, str]]] = None,
+        episodic_memories: Optional[List[Dict[str, Any]]] = None,
+        tools_summary: Optional[str] = None,
+    ) -> str:
+        sections: List[str] = [f"[TASK_INSTRUCTION]\n{task_instruction.strip()}"]
+
+        if session_history:
+            trimmed = [
+                f"- Q: {item['q'][:160]} -> A: {item['a'][:200]}"
+                for item in session_history[-3:]
+                if item.get("q")
+            ]
+            if trimmed:
+                sections.append("[RECENT_SESSION_WINDOW]\n" + "\n".join(trimmed))
+
+        if episodic_memories:
+            mem_lines = [
+                f"- [{m.get('key', 'mem')}]: {str(m.get('content', ''))[:200]}"
+                for m in episodic_memories[:3]
+            ]
+            if mem_lines:
+                sections.append("[RECALLED_EPISODIC_MEMORY]\n" + "\n".join(mem_lines))
+
+        if tools_summary:
+            sections.append(f"[AVAILABLE_TOOLS]\n{tools_summary}")
+
         manifest_text = json.dumps(manifest, ensure_ascii=False, indent=2)
-        compressed_prompt = f"""[TASK_INSTRUCTION]
-{task_instruction.strip()}
-
-[DATA_ANCHOR_MANIFEST]
-{manifest_text}
-
-[MANDATORY_OUTPUT_CONTRACT]
-You MUST respond strictly using the following 4 tags:
-<facts_anchor>
-(List exact ANCHOR_ID and raw values cited)
-</facts_anchor>
-<causal_chain>
-(Step-by-step logic citing ANCHOR_IDs without contradiction)
-</causal_chain>
-<execution_manifest>
-{{"files_created": [], "files_modified": [], "commands_executed": []}}
-</execution_manifest>
-<final_conclusion>
-(User-facing concise summary)
-</final_conclusion>
-"""
-        return compressed_prompt
+        sections.append(f"[DATA_ANCHOR_MANIFEST]\n{manifest_text}")
+        sections.append(
+            "[MANDATORY_OUTPUT_CONTRACT]\n"
+            "You MUST respond strictly using the following 4 tags:\n"
+            "<facts_anchor>\n(List exact ANCHOR_ID and raw values cited)\n</facts_anchor>\n"
+            "<causal_chain>\n(Step-by-step logic citing ANCHOR_IDs without contradiction)\n</causal_chain>\n"
+            "<execution_manifest>\n"
+            '{"files_created": [], "files_modified": [], "commands_executed": []}\n'
+            "</execution_manifest>\n"
+            "<final_conclusion>\n(User-facing concise summary)\n</final_conclusion>"
+        )
+        return "\n\n".join(sections) + "\n"
