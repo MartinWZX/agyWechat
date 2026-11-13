@@ -41,11 +41,13 @@ class CodeFirstCronScheduler:
         jobs_path: str = "scheduler/jobs.json",
         hub: Any = None,
         rsi_engine: Any = None,
+        health_monitor: Any = None,
     ):
         self.skill_manager = skill_manager
         self.bridge = bridge
         self.hub = hub
         self.rsi_engine = rsi_engine
+        self.health_monitor = health_monitor
         self.push_message_func = push_message_func
         self.settings = settings
         self.jobs_path = str(jobs_file_path or jobs_path)
@@ -122,13 +124,19 @@ class CodeFirstCronScheduler:
                 )
 
             self.stage1_success_count += 1
+            if self.health_monitor and hasattr(self.health_monitor, "record_cron_run"):
+                self.health_monitor.record_cron_run()
             await self._deliver_push(target_user, str(raw_result))
 
         except RequireCognitiveCLI as req:
             self.stage2_invocations_count += 1
             gate = CognitiveGate()
             manifest = gate.build_anchor_manifest(req.verified_payload)
-            prompt = gate.compress_context("Analyze system spike and suggest resolution.", manifest)
+            job_label = str(job.get("raw_sample") or job.get("name") or job_id)
+            prompt = gate.compress_context(
+                f"Analyze Stage-1 cron anomaly for '{job_label}' and suggest resolution.",
+                manifest,
+            )
             pref = None if req.preferred_engine == "auto" else req.preferred_engine
 
             if self.hub:
@@ -143,11 +151,24 @@ class CodeFirstCronScheduler:
             if self.rsi_engine and self.hub and script_path and os.path.exists(str(script_path)):
                 await self.rsi_engine.run_self_healing_cycle(str(script_path), str(err), self.hub)
 
+    def _persist_last_runs(self) -> None:
+        if not self.jobs:
+            return
+        try:
+            with open(self.jobs_path, "w", encoding="utf-8") as f:
+                json.dump(list(self.jobs.values()), f, ensure_ascii=False, indent=2)
+        except OSError as exc:
+            logger.debug("Failed to persist cron last_run metadata: %s", exc)
+
     async def execute_job(self, job: Dict[str, Any]) -> str:
         """Execute a single job immediately and record its run timestamp."""
         job_id = str(job.get("id", "adhoc"))
         await self._execute_job_pipeline(job)
-        self.last_run_map[job_id] = time.time()
+        now_ts = time.time()
+        self.last_run_map[job_id] = now_ts
+        if job_id in self.jobs:
+            self.jobs[job_id]["last_run"] = now_ts
+            self._persist_last_runs()
         return f"Stage 1 Routine Cron '{job_id}': Executed successfully (0 Token)."
 
     def is_job_due(self, job: Dict[str, Any], now_ts: Optional[float] = None) -> bool:
@@ -174,8 +195,11 @@ class CodeFirstCronScheduler:
         for job_id, job in list(self.jobs.items()):
             if self.is_job_due(job, now_ts=ts):
                 self.last_run_map[job_id] = ts
+                job["last_run"] = ts
                 await self._execute_job_pipeline(job)
                 executed += 1
+        if executed:
+            self._persist_last_runs()
         return executed
 
     async def start(self) -> None:

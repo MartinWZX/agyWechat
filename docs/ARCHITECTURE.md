@@ -80,9 +80,9 @@ $$\lim_{t \to \infty} P(\text{LLM Call}) = 0$$
    - `claude`：默认注入 `claude -p "<prompt>" --dangerously-skip-permissions --max-turns 3`；
    - `pi`：默认注入 `pi -p "<prompt>" --no-confirm`；
    - `omp`：默认注入 `omp run --dangerously-skip-permissions --yes -p "<prompt>"`。
-2. **外置 Python 沙盒安全硬防护 (`sandbox/approval_guard.py`)**：
-   - **高危命令拦截**：正则黑名单强力阻断 `rm -rf /`、`mkfs`、`shutdown`、`reboot`、`dd if=`、`chmod -R 777 /` 以及越界访问 `/etc/shadow`、`/etc/passwd`、`~/.ssh`、`~/.aws`；
-   - **危险函数 AST 静态分析**：禁止动态执行脚本中包含 `eval`、`exec`、`os.system`、`subprocess.Popen`、`shutil.rmtree`；
+2. **外置 Python 沙盒安全硬防护 (`sandbox/approval_guard.py` & `tools/tool_registry.py`)**：
+   - **高危命令拦截**：正则黑名单强力阻断 `rm -rf /`、`mkfs`、`shutdown`、`reboot`、`dd if=`、`chmod -R 777 /` 以及越界访问 `/etc/shadow`、`/etc/passwd`、`~/.ssh`、`~/.aws`；`tool_read_file`/`tool_write_file` 内置 `_validate_safe_file_path` 阻止 `..` 路径穿越与敏感凭证文件访问；
+   - **危险函数 AST 静态分析**：禁止动态执行脚本中包含 `eval`、`exec`、`os.system`、`subprocess.Popen`/`run`/`call`/`check_call`/`check_output`、`shutil.rmtree`、`importlib.import_module`、`ctypes.CDLL`、`socket.socket`；
    - **环境变量清洗**：调用子进程前自动剥离宿主机敏感凭证（`AWS_*`、`*_API_KEY`、`GITHUB_TOKEN`、`SSH_AUTH_SOCK`）。
 
 ### 铁律四：五维一体全自适应反风控防御体系 (`guard/wind_control_governor.py`)
@@ -136,19 +136,19 @@ $$\lim_{t \to \infty} P(\text{LLM Call}) = 0$$
 
 | 模块编号 | 模块职责与定位 | 核心文件与路径 | 关键类与函数 | 核心设计参数与指标 |
 |---------|---------------|---------------|-------------|-------------------|
-| **Module 1** | 微信双网关、签名幂等、原生语音识别与终端净化 | `gateway/ilink_client.py`<br>`gateway/ilink_gateway.py`<br>`gateway/wechat_gateway.py`<br>`gateway/voice_normalizer.py`<br>`gateway/terminal_cleaner.py` | `ILinkAPIClient`, `ILinkGatewayWorker`<br>`WeChatGateway`<br>`VoiceTextNormalizer`<br>`ANSICleaner` | 单一无死锁异步管线 `handle_message`；SHA-1 签名校验与 `msg_id` 幂等；VT100 控制符清洗 |
-| **Module 2** | 四级确定性路由 DAG 与认知上下文组装 | `router/pipeline.py`<br>`compressor/cognitive_gate.py` | `DeterministicRouter`<br>`SemanticCache`<br>`CognitiveGate` | T0 指令表 → T1 已验证 RSI 技能 → T2 语义缓存 → T3 认知调度；会话窗口 + FTS5 记忆召回注入 |
-| **Module 3** | 多智能体 CLI 驱动底座与上下文锚定错误分类 | `bridge/multi_cli_hub.py`<br>`bridge/error_classifier.py`<br>`bridge/agy_pty_bridge.py`<br>`bridge/drivers/*.py` | `MultiCLIHub`<br>`classify_cli_failure`<br>`AgyPTYBridge`<br>`BaseCLIAgentDriver` | 配置化注入；上下文锚定 429/403 分类（杜绝数字子串误熔断）；EWMA 健康路由 |
-| **Module 4** | 受控优先级并发槽池 | `bridge/multi_cli_hub.py` | `_PrioritySlotGate`<br>`execute_task` | 硬上限并发 $\le 2$（`P0 > P1 > P2` 优先级队列）；快照互斥防并发污染 |
-| **Module 5** | 五维一体反风控状态机 | `guard/wind_control_governor.py` | `WindControlGovernor`<br>`CircuitState` | 5m $\le 6$ 次，1h $\le 30$ 次；间隔 $\ge 12$s；抖动 $1.5 \sim 4.8$s；429 退避 `[120, 600, 1800]`s；403 锁定 24h |
-| **Module 6** | 受评估的高频意图固化与槽位提取 | `crystallizer/pattern_crystallizer.py`<br>`rsi/eval_harness.py` | `PatternCrystallizer`<br>`EvalHarness` | 结构化槽位提取；`candidate -> EvalHarness -> active -> degraded` 治理闭环；用户负反馈秒级降级 |
-| **Module 7** | 标准 5 段 Cron 解析与两阶段纯代码调度 | `scheduler/cron_expr.py`<br>`scheduler/code_first_cron.py`<br>`scheduler/jobs.json` | `cron_is_due`<br>`CodeFirstCronScheduler`<br>`RequireCognitiveCLI` | 纯标准库 5 段 Cron 精确匹配与分钟级去重；Stage-1 进程外沙盒巡检；失败自动触发自愈 |
-| **Module 8** | 持久化沙盒工具注册中心与 MCP 服务 | `tools/tool_registry.py`<br>`tools/mcp_server.py`<br>`tools/versions/manifest.json` | `ToolRegistry`<br>`MCPToolServer` | 动态工具进程外沙盒隔离运行；`manifest.json` 重启自动恢复与版本回滚；JSON-RPC 2.0 MCP Stdio 接口 |
-| **Module 9** | 四级递进式技能管理体系 | `skills/skill_manager.py`<br>`skills/scripts/`<br>`.agents/skills/` | `SkillManager` | L0 脚本统一经进程外沙盒 `run_file_async` 执行；L2/L3 技能沉淀；全局规则同步 |
-| **Module 10** | 外置沙盒守卫与进程外隔离执行器 | `sandbox/approval_guard.py`<br>`sandbox/runner.py` | `ApprovalGuard`<br>`run_code_sync`, `run_file_async`<br>`scrub_environment` | 主进程零 `exec`；`bubblewrap` 只读根文件系统 + 禁网 + 凭证目录遮蔽 + POSIX `rlimit`；子进程环境变量清洗 |
-| **Module 11** | 四维反幻觉物理校验闭环 | `verifier/hallucination_guard.py` | `WorkspaceSnapshotDiffer`<br>`LogicalConsistencyVerifier`<br>`ShadowDryRunValidator` | 流式 SHA-256 快照与 AST 桩代码检测；契约缺失强拦截；双向极性与数值阈值一致性校验 |
-| **Module 12** | 零泄漏连接管理、核心记忆与 RSI 仓储层 | `memory/sqlite_utils.py`<br>`memory/core_state_store.py`<br>`memory/rsi_repository.py` | `ClosingConnection`<br>`CoreStateStore`<br>`RSIRepository` | 上下文退出自动关闭 FD（零句柄泄漏）；增量幂等 Schema 迁移；WAL + FTS5；禁止跨层裸写 SQL |
-| **Module 13** | RSI 递归自演进生命周期与自愈引擎 | `rsi/evolution_engine.py`<br>`rsi/eval_harness.py` | `LifecyclePhaseController`<br>`StageRoutingPolicy`<br>`EvolutionEngine` | 成熟度评分实时映射 `StageRoutingPolicy`（动态控制技能/缓存阈值与日预算）；异常脚本自动自愈与验证恢复 |
+| **Module 1** | 微信双网关、签名幂等、原生语音识别与终端净化 | `gateway/ilink_client.py`<br>`gateway/ilink_gateway.py`<br>`gateway/wechat_gateway.py`<br>`gateway/voice_normalizer.py`<br>`gateway/terminal_cleaner.py` | `ILinkAPIClient`, `ILinkGatewayWorker`, `ILinkPusher`<br>`WeChatGateway`, `RuleMatcher`<br>`VoiceTextNormalizer`<br>`ANSICleaner` | 单一无死锁异步管线 `handle_message`；仅语音走去口癖，普通文本保留原义；`is_feedback_retry` 跳过强化重激活；`.sync_buf` 持久化、`OrderedDict` 有界去重、`WeChatSplitter` 分片与 `ret`/`errcode` 校验 |
+| **Module 2** | 四级确定性路由 DAG 与认知上下文组装 | `router/pipeline.py`<br>`compressor/cognitive_gate.py` | `DeterministicRouter`<br>`SemanticCache`<br>`CognitiveGate` | T0 指令表 → T1 已验证 RSI 技能 → T2 语义缓存 → T3 认知调度；保留 `base_query`/`preferred_engine`，Tier-1 失败触发 `priority=0` 实时自愈与即时沙箱重跑 (`T1_SKILL_HEALED`) |
+| **Module 3** | 多智能体 CLI 驱动底座与上下文锚定错误分类 | `bridge/multi_cli_hub.py`<br>`bridge/error_classifier.py`<br>`bridge/agy_pty_bridge.py`<br>`bridge/drivers/*.py` | `MultiCLIHub`<br>`classify_cli_failure`<br>`AgyPTYBridge`<br>`BaseCLIAgentDriver` | 配置化注入；上下文锚定 429/403 分类（杜绝数字子串误熔断）；EWMA 健康路由；阶段 `daily_llm_budget` 硬上限拦截 |
+| **Module 4** | 受控优先级并发槽池与快照隔离 | `bridge/multi_cli_hub.py` | `_PrioritySlotGate`<br>`execute_task` | 硬上限并发 $\le 2$（`P0 > P1 > P2` 优先级队列）；每任务独立 `WorkspaceSnapshotDiffer` 经 `asyncio.to_thread` 卸载；支持 `strict_manifest_check` 受控切换 |
+| **Module 5** | 五维一体反风控状态机 | `guard/wind_control_governor.py` | `WindControlGovernor`<br>`CircuitState` | 兼容 `Settings` + YAML 配置；5m $\le 6$、1h $\le 30$、24h $\le 200$ 限流与日界清零；支持跨午夜 `quiet_hours`；429 退避 `[120, 600, 1800]`s；403 锁定；安全管理员默认 `["admin_user"]` |
+| **Module 6** | 受评估的高频意图固化与槽位碰撞保护 | `crystallizer/pattern_crystallizer.py`<br>`rsi/eval_harness.py` | `PatternCrystallizer`<br>`EvalHarness` | 结构化槽位提取 + 槽位碰撞保护（防止多变量问答误固化为静态常量）；`candidate -> EvalHarness -> active -> degraded` 治理闭环；系统探针 Cron 支持 `check_determinism=False` |
+| **Module 7** | 标准 5 段 Cron 解析、两阶段调度与遥测 | `scheduler/cron_expr.py`<br>`scheduler/code_first_cron.py`<br>`telemetry/health_monitor.py`<br>`main.py` | `cron_is_due`<br>`CodeFirstCronScheduler`<br>`HealthMonitor` | 纯标准库 5 段 Cron 精确匹配、分钟去重与 `last_run` 持久化；Stage-1 沙盒巡检失败触发自愈；`get_offload_rate()` 计入 Stage-1 Cron；支持 `WECHAT_PUSH_URL` + `X-Bot-Secret` 推送 |
+| **Module 8** | 持久化沙盒工具注册中心与 MCP 服务 | `tools/tool_registry.py`<br>`tools/mcp_server.py`<br>`tools/versions/manifest.json` | `ToolRegistry`<br>`MCPToolServer` | 动态工具 AST 提取 `inspect.Signature` 自动生成 MCP `inputSchema`；工作区级 `versions_dir` 恢复与回滚；`_validate_safe_file_path` 阻断敏感文件与 `..` 路径穿越 |
+| **Module 9** | 四级递进式技能管理体系 | `skills/skill_manager.py`<br>`skills/scripts/`<br>`.agents/skills/` | `SkillManager` | L0 脚本统一经进程外沙盒 `run_file_async` 执行；L2/L3 技能沉淀；持久化 `voice_homophones` 与 `#规则`/`#演进`/`#rsi` 同步 |
+| **Module 10** | 外置沙盒守卫与进程外隔离执行器 | `sandbox/approval_guard.py`<br>`sandbox/runner.py` | `ApprovalGuard`<br>`run_code_sync`, `run_file_async`<br>`scrub_environment` | 主进程零 `exec`；AST 拦截 `subprocess.run/Popen`、`importlib`、`ctypes.CDLL`、`socket.socket`；`run_code_async` 经 `asyncio.to_thread` 卸载 `bwrap` 构建；环境变量清洗 |
+| **Module 11** | 四维反幻觉物理校验闭环 | `verifier/hallucination_guard.py` | `WorkspaceSnapshotDiffer`<br>`LogicalConsistencyVerifier`<br>`ShadowDryRunValidator` | 流式 SHA-256 快照对新建与修改文件 (`files_modified`) 均执行 `TODO`/AST 桩检测，校验 `files_deleted` 欠执行与越权回滚 |
+| **Module 12** | 零泄漏连接管理、核心记忆与 RSI 仓储层 | `memory/sqlite_utils.py`<br>`memory/core_state_store.py`<br>`memory/rsi_repository.py` | `ClosingConnection`<br>`CoreStateStore`<br>`RSIRepository` | 上下文退出自动关闭 FD（零句柄泄漏）；WAL + FTS5 查询标点安全分词与 `OperationalError` 降级兜底；已验证问答自动沉淀至长期记忆 |
+| **Module 13** | RSI 递归自演进生命周期与自愈引擎 | `rsi/evolution_engine.py`<br>`rsi/eval_harness.py` | `LifecyclePhaseController`<br>`StageRoutingPolicy`<br>`EvolutionEngine` | 成熟度评分实时映射 `StageRoutingPolicy`；区分瞬态风控拒绝（置 `degraded`）与缺失/校验失败脚本（置 `retired`），防止误永久退役规则 |
 
 ---
 
@@ -294,7 +294,7 @@ agyWechat/
 │   └── evolution_engine.py   # 领域成熟度量化、生命周期阶段控制、熵减调度
 ├── telemetry/                # 监控与遥测
 │   └── health_monitor.py     # 系统健康度打分与多维指标统计
-├── tests/                    # 完整端到端与单元测试集 (44 测试用例, 100% 通过)
+├── tests/                    # 完整端到端与单元测试集 (60 测试用例, 100% 通过)
 └── docs/                     # 系统架构设计与项目介绍白皮书
     ├── ARCHITECTURE.md
     └── PROJECT_INTRODUCTION.md
@@ -306,15 +306,15 @@ agyWechat/
 
 | 验证维度 | 物理指标设计值 | 实际代码实现与验证源 | 自动化测试状态 |
 |---------|---------------|-------------------|---------------|
-| **进程全局单例性** | 宿主全局文件锁 `flock` 互斥保护 | `main.py` (`LOCK_FILE`) / `bridge/agy_pty_bridge.py` | `test_host_mode_lock_singleton` (PASSED) |
-| **滑动窗口速率限制** | 5m $\le 6$ 次，1h $\le 30$ 次，最小间隔 12s | `guard/wind_control_governor.py` / `config.yaml` | `test_governor_window_and_cooldown` (PASSED) |
-| **反风控阶梯退避** | 429 阶梯退避 `[120, 600, 1800]`s；403 锁定 24h | `guard/wind_control_governor.py` | `test_governor_window_and_cooldown` (PASSED) |
-| **免确认执行安全性** | 内层放权，外层沙盒阻断 `rm -rf /`、`/etc/passwd` 等高危项 | `sandbox/approval_guard.py` | `test_sandbox_blocked_commands` (PASSED) |
-| **物理反幻觉校验** | SHA-256 全量快照比对，严禁占位符，未声明自动回滚 | `verifier/hallucination_guard.py` | `test_snapshot_differ_under_execution` (PASSED) |
-| **微信原生语音识别** | 优先直提 `Recognition`，拼音同音纠错准确率 > 98% | `gateway/voice_normalizer.py` | `test_voice_normalizer_homophones` (PASSED) |
-| **RSI 治理闭环与自愈** | $N \ge 3$ + 答案一致性通过 `EvalHarness` 方可激活；负反馈立即降级；异常脚本自动自愈 | `crystallizer/pattern_crystallizer.py` / `rsi/eval_harness.py` / `router/pipeline.py` | `test_p1_governed_rsi_closed_loop_negative_feedback_and_self_healing` (PASSED) |
-| **进程外沙盒与防误熔断** | 主进程零 `exec`（`bwrap` 只读隔离）；429/403 上下文锚定分类；并发槽 $\le 2$ | `sandbox/runner.py` / `bridge/error_classifier.py` / `bridge/multi_cli_hub.py` | `test_architecture_v3_upgrades.py` (PASSED) |
-| **全量回归测试** | 全部生产模块单文件 $\le 400$ 行、AST 契约零违规、60 项端到端与单元测试 100% 通过 | `./venv/bin/pytest tests/` | **60 passed** |
+| **网关鉴权与安全默认** | Webhook HMAC 签名、幂等去重；管理员无通配符 `"*"` 兜底 | `main.py` / `guard/wind_control_governor.py` | `test_s5_webhook_signature_auth_idempotency_and_safe_admin_default` (PASSED) |
+| **滑动窗口速率限制** | 5m $\le 6$ 次，1h $\le 30$ 次，24h $\le 200$ 次，最小间隔 12s | `guard/wind_control_governor.py` / `config.yaml` | `test_wind_control_governor_5d` / `test_08_wind_control_rate_limit` (PASSED) |
+| **反风控阶梯退避** | 429 阶梯退避 `[120, 600, 1800]`s；403 锁定 24h | `guard/wind_control_governor.py` | `test_s2_anchored_429_403_classifier_blocks_substring_false_positives` (PASSED) |
+| **免确认执行与 AST/路径隔离** | 内层放权，外层阻断高危命令、`subprocess.*`/`importlib`/`ctypes`/`socket` 与越权路径 | `sandbox/approval_guard.py` / `tools/tool_registry.py` | `test_approval_guard_enforces_all_prohibited_calls_and_aliases` (PASSED) |
+| **物理反幻觉校验** | SHA-256 全量快照比对，新建与修改文件均严禁占位符，未声明自动回滚 | `verifier/hallucination_guard.py` | `test_04_anti_hallucination_under_execution` / `test_05_anti_hallucination_over_execution` (PASSED) |
+| **微信原生语音识别与记忆** | 优先直提 `Recognition`，纯文本免去口癖；FTS5 查询符号安全分词 | `gateway/voice_normalizer.py` / `memory/core_state_store.py` | `test_01_voice_normalizer` / `test_core_state_store_and_fts5` (PASSED) |
+| **RSI 治理闭环与自愈** | $N \ge 3$ + `EvalHarness` 激活；负反馈立即降级且不重激活；异常脚本即时自愈 | `crystallizer/pattern_crystallizer.py` / `rsi/eval_harness.py` / `router/pipeline.py` | `test_p1_governed_rsi_closed_loop_negative_feedback_and_self_healing` (PASSED) |
+| **MCP 工具与进程外沙盒** | `bwrap` 隔离执行；AST 提取参数 Schema 暴露 MCP 接口；零泄露 Pre-Push 审计 | `sandbox/runner.py` / `tools/mcp_server.py` / `tools/audit_tools.py` | `test_r5_tool_persistence_and_p2_mcp_server` / `test_git_zero_leakage_audit_and_ast_audit` (PASSED) |
+| **全量回归测试** | 全部修改模块单文件 $< 400$ 行、AST 契约零违规、60 项端到端与单元测试 100% 通过 | `./venv/bin/python -m pytest -v` | **60 passed** |
 
 ---
 > **结论**：本白皮书与物理代码库实现保持 100% 的字符级严谨对齐，杜绝任何参数偏离或口嗨虚构。

@@ -215,8 +215,9 @@ async def run_code_async(
 ) -> SandboxResult:
     """Asynchronously execute code in an isolated child interpreter without blocking the event loop."""
     _security_gate(code)
+    cmd = await asyncio.to_thread(_build_command, allow_network)
     proc = await asyncio.create_subprocess_exec(
-        *_build_command(allow_network),
+        *cmd,
         stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         env=_minimal_env(), cwd=tempfile.gettempdir(),
         preexec_fn=_make_preexec(int(timeout) + 1, memory_bytes),

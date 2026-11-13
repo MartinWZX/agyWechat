@@ -1,7 +1,9 @@
 """Deterministic Tool Registry with Sandboxed Dynamic Tools, Persistent Snapshots & Trace Audit."""
 import ast
+import inspect
 import json
 import os
+from pathlib import Path
 import re
 import shutil
 import subprocess
@@ -15,8 +17,38 @@ from tools.audit_tools import run_ast_contract_audit, run_git_zero_leakage_audit
 from verifier.hallucination_guard import ShadowDryRunError, ShadowDryRunValidator
 
 
-def _locate_entrypoint_in_ast(tree: ast.Module, tool_name: str) -> Optional[Tuple[str, str]]:
-    """Locate target function name and docstring in AST without executing untrusted code."""
+_AST_TYPE_MAP = {"int": int, "float": float, "bool": bool, "str": str, "list": list, "dict": dict}
+
+
+def _annotation_from_ast(node: Optional[ast.expr]) -> Any:
+    return _AST_TYPE_MAP.get(node.id, inspect.Parameter.empty) if isinstance(node, ast.Name) else inspect.Parameter.empty
+
+
+def _build_ast_signature(fn_node: ast.FunctionDef) -> inspect.Signature:
+    """Build inspect.Signature from an AST FunctionDef without executing untrusted code."""
+    pos_args = list(fn_node.args.posonlyargs) + list(fn_node.args.args)
+    offset = len(pos_args) - len(fn_node.args.defaults)
+    specs = [
+        (arg, inspect.Parameter.POSITIONAL_OR_KEYWORD, fn_node.args.defaults[i - offset] if i >= offset else None)
+        for i, arg in enumerate(pos_args)
+    ] + [
+        (kw, inspect.Parameter.KEYWORD_ONLY, kd)
+        for kw, kd in zip(fn_node.args.kwonlyargs, fn_node.args.kw_defaults)
+    ]
+    params = [
+        inspect.Parameter(
+            a.arg,
+            kind,
+            default=d.value if isinstance(d, ast.Constant) else inspect.Parameter.empty,
+            annotation=_annotation_from_ast(a.annotation),
+        )
+        for a, kind, d in specs
+    ]
+    return inspect.Signature(params, return_annotation=_annotation_from_ast(fn_node.returns))
+
+
+def _locate_entrypoint_in_ast(tree: ast.Module, tool_name: str) -> Optional[Tuple[str, str, inspect.Signature]]:
+    """Locate target function name, docstring, and signature in AST without executing untrusted code."""
     funcs: Dict[str, ast.FunctionDef] = {}
     first_name: Optional[str] = None
     for node in tree.body:
@@ -28,10 +60,12 @@ def _locate_entrypoint_in_ast(tree: ast.Module, tool_name: str) -> Optional[Tupl
     if chosen is None:
         return None
     doc = ast.get_docstring(chosen) or f"Dynamic sandboxed tool '{tool_name}'"
-    return chosen.name, doc
+    return chosen.name, doc, _build_ast_signature(chosen)
 
 
-def _make_sandboxed_tool(tool_name: str, entrypoint: str, code: str, doc: str) -> Callable:
+def _make_sandboxed_tool(
+    tool_name: str, entrypoint: str, code: str, doc: str, sig: Optional[inspect.Signature] = None,
+) -> Callable:
     """Create a host-safe callable wrapper that executes dynamic tool code out-of-process."""
     def _runner(**kwargs: Any) -> Any:
         res = run_code_sync(
@@ -48,6 +82,8 @@ def _make_sandboxed_tool(tool_name: str, entrypoint: str, code: str, doc: str) -
 
     _runner.__name__ = entrypoint
     _runner.__doc__ = doc
+    if sig is not None:
+        _runner.__signature__ = sig  # type: ignore[attr-defined]
     return _runner
 
 
@@ -90,13 +126,14 @@ class ToolRegistry:
         return {}
 
     @classmethod
-    def load_persisted_tools(cls) -> int:
+    def load_persisted_tools(cls, versions_dir: Optional[str] = None) -> int:
         """Reload dynamically mutated tools from `tools/versions/` on process startup."""
-        if not os.path.isdir(cls._versions_dir):
+        vdir = versions_dir or cls._versions_dir
+        if not os.path.isdir(vdir):
             return 0
-        manifest = cls._load_manifest()
+        manifest = cls._load_manifest(vdir)
         if not manifest:
-            for fname in os.listdir(cls._versions_dir):
+            for fname in os.listdir(vdir):
                 m = re.match(r"^([a-zA-Z0-9_]+)_v(\d+)\.py$", fname)
                 if m:
                     tname, ver = m.group(1), int(m.group(2))
@@ -106,7 +143,7 @@ class ToolRegistry:
         for tool_name, version in manifest.items():
             if tool_name in cls._tools:
                 continue
-            vpath = os.path.join(cls._versions_dir, f"{tool_name}_v{version}.py")
+            vpath = os.path.join(vdir, f"{tool_name}_v{version}.py")
             if not os.path.isfile(vpath):
                 continue
             try:
@@ -116,9 +153,10 @@ class ToolRegistry:
                 tree = ast.parse(code)
                 located = _locate_entrypoint_in_ast(tree, tool_name)
                 if located:
-                    entry, doc = located
-                    cls._tools[tool_name] = _make_sandboxed_tool(tool_name, entry, code, doc)
+                    entry, doc, sig = located
+                    cls._tools[tool_name] = _make_sandboxed_tool(tool_name, entry, code, doc, sig)
                     cls._tool_versions[tool_name] = version
+                    cls._tool_dirs[tool_name] = vdir
                     loaded += 1
             except (OSError, SyntaxError, SandboxSecurityError):
                 continue
@@ -226,7 +264,7 @@ class ToolRegistry:
         located = _locate_entrypoint_in_ast(tree, tool_name)
         if not located:
             return False, f"Could not locate callable function for tool '{tool_name}' in code."
-        entry, doc = located
+        entry, doc, sig = located
 
         os.makedirs(vdir, exist_ok=True)
         current_v = cls._tool_versions.get(tool_name, 0)
@@ -235,7 +273,7 @@ class ToolRegistry:
         with open(version_path, "w", encoding="utf-8") as f:
             f.write(tool_code.strip() + "\n")
 
-        cls._tools[tool_name] = _make_sandboxed_tool(tool_name, entry, tool_code, doc)
+        cls._tools[tool_name] = _make_sandboxed_tool(tool_name, entry, tool_code, doc, sig)
         cls._tool_versions[tool_name] = next_v
         cls._tool_dirs[tool_name] = vdir
         manifest = cls._load_manifest(vdir)
@@ -266,9 +304,9 @@ class ToolRegistry:
         located = _locate_entrypoint_in_ast(tree, tool_name)
         if not located:
             return False, "Failed to locate entrypoint in previous version."
-        entry, doc = located
+        entry, doc, sig = located
 
-        cls._tools[tool_name] = _make_sandboxed_tool(tool_name, entry, code, doc)
+        cls._tools[tool_name] = _make_sandboxed_tool(tool_name, entry, code, doc, sig)
         cls._tool_versions[tool_name] = prev_v
         manifest = cls._load_manifest(vdir)
         manifest[tool_name] = prev_v
@@ -279,20 +317,41 @@ class ToolRegistry:
 registry = ToolRegistry()
 
 
+_FORBIDDEN_FILE_SEGMENTS = ("/.ssh/", "/.aws/", "/.gnupg/", "/.config/gcloud/", "/etc/shadow", "/etc/passwd")
+
+
+def _validate_safe_file_path(path: str) -> Path:
+    resolved = Path(path).expanduser().resolve()
+    posix = resolved.as_posix()
+    if any(seg in posix for seg in _FORBIDDEN_FILE_SEGMENTS) or (
+        resolved.name.startswith(".env") and resolved.name != ".env.example"
+    ):
+        raise SandboxSecurityError(f"Access to protected path '{path}' is forbidden.")
+    workspace_root = Path.cwd().resolve()
+    if not Path(path).is_absolute():
+        try:
+            resolved.relative_to(workspace_root)
+        except ValueError as exc:
+            raise SandboxSecurityError(f"Relative path '{path}' escapes workspace boundary.") from exc
+    return resolved
+
+
 @ToolRegistry.register("read_file")
 def tool_read_file(path: str) -> str:
     """Read full contents of a file within the workspace."""
-    with open(path, "r", encoding="utf-8") as f:
+    safe_path = _validate_safe_file_path(path)
+    with open(safe_path, "r", encoding="utf-8") as f:
         return f.read()
 
 
 @ToolRegistry.register("write_file")
 def tool_write_file(path: str, content: str) -> str:
     """Write text content to a file within the workspace."""
-    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
+    safe_path = _validate_safe_file_path(path)
+    safe_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(safe_path, "w", encoding="utf-8") as f:
         f.write(content)
-    return f"Successfully wrote {len(content)} bytes to {path}"
+    return f"Successfully wrote {len(content)} bytes to {safe_path}"
 
 
 @ToolRegistry.register("system_metrics")

@@ -163,6 +163,7 @@ class EvolutionEngine:
         error_traceback: str,
         hub: Any,
         rule_name: Optional[str] = None,
+        priority: int = 1,
     ) -> bool:
         """Self-healing loop: wake up LLM CLI once with traceback, verify via EvalHarness, and restore."""
         if not os.path.exists(failed_script_path):
@@ -182,14 +183,26 @@ class EvolutionEngine:
             f'<crystallize_script name="{stem}">\n# fixed python code\n</crystallize_script>\n'
         )
         manifest = {"anchors": {"ANCHOR_1_error": {"error": error_traceback}}, "manifest_hash": "self_healing"}
-        success, answer, _ = await hub.execute_task(heal_prompt, manifest, priority=1, preferred_engine="claude")
+        success, answer, _ = await hub.execute_task(
+            heal_prompt,
+            manifest,
+            priority=priority,
+            preferred_engine="claude",
+            auto_apply_rsi_hooks=False,
+        )
         if not success:
+            transient_block = any(
+                marker in (answer or "")
+                for marker in ("Quiet hours", "unavailable", "rate limit", "COOLDOWN", "LOCKDOWN", "BUDGET_EXCEEDED")
+            )
             if rule_name:
-                self.repo.set_rule_status(rule_name, "retired")
+                self.repo.set_rule_status(rule_name, "degraded" if transient_block else "retired")
             return False
 
         match = re.search(r'<crystallize_script\s+name="[^"]*">\s*(.*?)\s*</crystallize_script>', answer, re.DOTALL)
         if not match:
+            if rule_name:
+                self.repo.set_rule_status(rule_name, "retired")
             return False
 
         fixed_code = match.group(1).strip()
@@ -211,7 +224,8 @@ class EvolutionEngine:
         """Background maintenance loop refreshing global agent specs and stage routing policy."""
         self.running = True
         self.skill_manager.sync_global_agent_rules()
-        ToolRegistry.load_persisted_tools()
+        vdir = os.path.join(self.workspace_dir, "tools", "versions") if self.workspace_dir != "." else None
+        ToolRegistry.load_persisted_tools(versions_dir=vdir)
         while self.running:
             self.current_policy = self.phase_controller.get_stage_policy()
             logger.debug(

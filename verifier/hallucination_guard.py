@@ -132,29 +132,24 @@ class WorkspaceSnapshotDiffer:
                 raise UnderExecutionHallucinationError(
                     f"Claimed to create '{cf}', but file was not created physically!"
                 )
-            full_cf = os.path.join(self.workspace_dir, cf)
-            if os.path.exists(full_cf):
-                with open(full_cf, "r", encoding="utf-8", errors="ignore") as f:
-                    content = f.read()
-                if re.search(r"\b(?:TODO|FIXME)\b", content):
-                    raise UnderExecutionHallucinationError(
-                        f"Claimed file '{cf}' contains lazy TODO/FIXME placeholders!"
-                    )
-                if cf.endswith(".py"):
-                    stub_issue = _has_python_ast_stubs(content)
-                    if stub_issue:
-                        raise UnderExecutionHallucinationError(
-                            f"Claimed Python file '{cf}' contains stub ({stub_issue})!"
-                        )
+            self._verify_no_stubs_or_placeholders(cf, "create")
 
         for mf in claimed_modified:
             if mf not in diff["modified"]:
                 raise UnderExecutionHallucinationError(
                     f"Claimed to modify '{mf}', but no physical hash change detected!"
                 )
+            self._verify_no_stubs_or_placeholders(mf, "modify")
+
+        claimed_deleted = set(manifest.get("files_deleted", []))
+        for df in claimed_deleted:
+            if df not in diff["deleted"]:
+                raise UnderExecutionHallucinationError(
+                    f"Claimed to delete '{df}', but file was not deleted physically!"
+                )
 
         actual_all_changed = diff["created"] | diff["modified"] | diff["deleted"]
-        claimed_all = claimed_created | claimed_modified | set(manifest.get("files_deleted", []))
+        claimed_all = claimed_created | claimed_modified | claimed_deleted
         undeclared_changes = actual_all_changed - claimed_all
 
         if allowed_scope is not None:
@@ -175,6 +170,23 @@ class WorkspaceSnapshotDiffer:
             )
 
         return True, "Physical snapshot audit passed: 100% action-speech consistency."
+
+    def _verify_no_stubs_or_placeholders(self, rel_path: str, action: str) -> None:
+        full_path = os.path.join(self.workspace_dir, rel_path)
+        if not os.path.isfile(full_path):
+            return
+        with open(full_path, "r", encoding="utf-8", errors="ignore") as f:
+            content = f.read()
+        if re.search(r"\b(?:TODO|FIXME)\b", content):
+            raise UnderExecutionHallucinationError(
+                f"Claimed {action} file '{rel_path}' contains lazy TODO/FIXME placeholders!"
+            )
+        if rel_path.endswith(".py"):
+            stub_issue = _has_python_ast_stubs(content)
+            if stub_issue:
+                raise UnderExecutionHallucinationError(
+                    f"Claimed {action} Python file '{rel_path}' contains stub ({stub_issue})!"
+                )
 
     def rollback_undeclared(self, pre_snap: Dict[str, str], undeclared_files: Set[str]) -> None:
         """Deterministically revert undeclared files to restore initial state."""

@@ -33,6 +33,8 @@ class RuleMatcher:
             return True, f"五维防御看板\n{run_dashboard(db_path=db_path)}"
         if t in ["#幻觉审计", "幻觉审计"]:
             return True, run_audit(db_path=db_path)
+        if t in ["#规则", "#演进", "#rsi"]:
+            return True, "请通过网关主路由查看 RSI 演进看板。"
         if t in ["#help", "帮助", "使用说明"]:
             return True, (
                 "WeChat-AGY 系统帮助手册：\n"
@@ -105,7 +107,19 @@ class WeChatGateway:
             hub=self.hub,
             settings=self.settings,
         )
+        self._load_rule_homophones()
         self.active_user: Optional[str] = None
+
+    def _load_rule_homophones(self) -> None:
+        """Load persisted voice homophone aliases from crystallized rules into normalizer."""
+        for rule in self.det_router.repo.list_rules(statuses=["active"]):
+            raw_vh = str(rule.get("voice_homophones") or "").strip()
+            if not raw_vh:
+                continue
+            target = str(rule.get("rule_name") or "").strip()
+            for alias in re.split(r"[,，|;；\s]+", raw_vh):
+                if alias.strip() and target:
+                    self.normalizer.learn_homophone(alias.strip(), f"#{target}")
 
     async def handle_message(
         self,
@@ -134,7 +148,7 @@ class WeChatGateway:
                 self.store.log_hallucination(msg_id, "gateway", "CORRUPTED_ASR", reason)
                 return f"{echo_header}⚠️ 语音识别结果不够清晰，为防止误操作，请重发语音或发送文字指令确认。"
         else:
-            normalized_text = self.normalizer.normalize(raw_payload.strip())
+            normalized_text = raw_payload.strip()
             echo_header = ""
 
         # Tier-0 / Tier-1 / Tier-2 deterministic routing
@@ -149,14 +163,17 @@ class WeChatGateway:
             return echo_header + decision.reply
 
         eff_query = decision.effective_query or normalized_text
+        clean_query = decision.base_query or eff_query
+        is_feedback_retry = decision.tier == "T3_FEEDBACK_RETRY"
         threshold = int(self.config.get("crystallization", {}).get("faq_solidify_threshold", 3))
-        await self.crystallizer.observe_message(eff_query, threshold=threshold)
+        if not is_feedback_retry:
+            await self.crystallizer.observe_message(clean_query, threshold=threshold)
 
         # Auto-solidify periodic Cron when CV <= 0.25 and not yet proposed
         auto_cron = bool(self.config.get("crystallization", {}).get("auto_cron_enabled", True))
-        fp = self.crystallizer.extract_fingerprint(eff_query)
+        fp = self.crystallizer.extract_fingerprint(clean_query)
         cron_notice = ""
-        if auto_cron:
+        if auto_cron and not is_feedback_retry:
             pat = self.crystallizer.repo.get_pattern(fp)
             if pat and not pat.get("cron_proposed"):
                 p_info = self.crystallizer.detect_periodicity(fp)
@@ -177,7 +194,7 @@ class WeChatGateway:
             return echo_header + final_reply + cron_notice
 
         session_hist = self.store.get_recent_exchanges(user_id, limit=3)
-        memories = await self.store.search_episodic_memory(eff_query, limit=3)
+        memories = await self.store.search_episodic_memory(clean_query, limit=3)
         tools_summary = ", ".join(
             f"{s['name']}({s['version']})" for s in ToolRegistry.list_tool_signatures()
         )
@@ -195,6 +212,7 @@ class WeChatGateway:
             manifest,
             priority=0,
             preferred_engine=decision.preferred_engine,
+            auto_apply_rsi_hooks=False,
         )
 
         if not success:
@@ -202,15 +220,26 @@ class WeChatGateway:
         else:
             final_reply = _extract_final_conclusion(answer)
             policy = self.rsi_engine.phase_controller.get_stage_policy()
-            self.crystallizer.crystallize_from_response(answer, auto_promote=policy.auto_promote_verified)
-            self.rsi_engine.process_model_rsi_patches(answer)
-            self.crystallizer.record_verified_interaction(
-                eff_query,
-                final_reply,
-                threshold=threshold,
-                auto_promote=policy.auto_promote_verified,
+            self.crystallizer.crystallize_from_response(
+                answer, auto_promote=policy.auto_promote_verified, normalizer=self.normalizer
             )
-            self.det_router.cache.put(eff_query, fp, final_reply)
+            self.rsi_engine.process_model_rsi_patches(answer)
+            if not is_feedback_retry:
+                self.crystallizer.record_verified_interaction(
+                    clean_query,
+                    final_reply,
+                    threshold=threshold,
+                    auto_promote=policy.auto_promote_verified,
+                )
+                self.det_router.cache.put(clean_query, fp, final_reply)
+                if self.det_router.cache.is_cacheable(clean_query):
+                    fp_hash = self.crystallizer.get_pattern_hash(fp)
+                    await self.store.set_episodic_memory(
+                        user_id,
+                        "qa_fact",
+                        fp_hash,
+                        f"Q: {clean_query[:120]} -> A: {final_reply[:240]}",
+                    )
 
         self.store.record_message(
             msg_id, f"session_{user_id}", user_id, msg_type, raw_payload,

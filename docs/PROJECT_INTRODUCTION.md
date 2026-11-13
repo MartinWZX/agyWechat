@@ -112,8 +112,8 @@ WECHAT_PUSH_URL="http://127.0.0.1:8000/mock/wechat/push"
 ### 3. 一键运行与测试验证
 
 ```bash
-# 执行全量单元测试与反幻觉测试 (44 测试项, 100% 通过)
-./venv/bin/pytest tests/
+# 执行全量单元测试与反幻觉测试 (60 测试项, 100% 通过)
+./venv/bin/python -m pytest tests/
 
 # 启动单进程生产服务
 ./venv/bin/python main.py

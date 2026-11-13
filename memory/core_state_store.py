@@ -1,5 +1,6 @@
 """SQLite WAL Mode State Store with Single-Writer Pattern & FTS5."""
 import os
+import re
 import sqlite3
 import time
 from pathlib import Path
@@ -333,35 +334,36 @@ class CoreStateStore:
             conn.commit()
 
     async def search_episodic_memory(self, query: str, limit: int = 5) -> List[Dict[str, Any]]:
+        tokens = [t for t in re.findall(r"[A-Za-z0-9_\u4e00-\u9fff]+", query) if len(t) >= 2]
+        fts_query = " OR ".join(f'"{tok}"' for tok in tokens[:8]) if tokens else ""
         with self._get_connection() as conn:
             cursor = conn.cursor()
-            try:
-                cursor.execute("""
-                SELECT m.memory_key, m.content, m.tags
-                FROM episodic_memories_fts f
-                JOIN episodic_memories m ON f.rowid = m.id
-                WHERE episodic_memories_fts MATCH ?
-                LIMIT ?;
-                """, (query, limit))
-                results = []
-                for row in cursor.fetchall():
-                    d = dict(row)
-                    key_part = d["memory_key"].split(":")[-1] if ":" in d["memory_key"] else d["memory_key"]
-                    d["key"] = key_part
-                    results.append(d)
-                return results
-            except Exception:
-                cursor.execute("""
-                SELECT memory_key, content, tags FROM episodic_memories
-                WHERE content LIKE ? OR memory_key LIKE ? LIMIT ?;
-                """, (f"%{query}%", f"%{query}%", limit))
-                results = []
-                for row in cursor.fetchall():
-                    d = dict(row)
-                    key_part = d["memory_key"].split(":")[-1] if ":" in d["memory_key"] else d["memory_key"]
-                    d["key"] = key_part
-                    results.append(d)
-                return results
+            rows: List[Any] = []
+            if fts_query:
+                try:
+                    cursor.execute(
+                        "SELECT m.memory_key, m.content, m.tags FROM episodic_memories_fts f "
+                        "JOIN episodic_memories m ON f.rowid = m.id "
+                        "WHERE episodic_memories_fts MATCH ? LIMIT ?;",
+                        (fts_query, limit),
+                    )
+                    rows = cursor.fetchall()
+                except sqlite3.OperationalError:
+                    rows = []
+            if not rows:
+                cursor.execute(
+                    "SELECT memory_key, content, tags FROM episodic_memories "
+                    "WHERE content LIKE ? OR memory_key LIKE ? LIMIT ?;",
+                    (f"%{query}%", f"%{query}%", limit),
+                )
+                rows = cursor.fetchall()
+            results = []
+            for row in rows:
+                d = dict(row)
+                mk = d["memory_key"]
+                d["key"] = mk.split(":")[-1] if ":" in mk else mk
+                results.append(d)
+            return results
 
     def log_hallucination(self, task_id: str, engine_id: str, h_type: str, details: str, reverted: bool = False):
         with self._get_connection() as conn:

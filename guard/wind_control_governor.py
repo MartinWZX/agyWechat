@@ -46,17 +46,17 @@ class WindControlGovernor:
 
         # Resolve Config & Settings
         self.settings = None
-        self.config = {}
+        self.config: Dict[str, Any] = dict(config) if isinstance(config, dict) else {}
         if hasattr(config_or_settings, "MIN_COOLDOWN_SECONDS"):
             self.settings = config_or_settings
         elif isinstance(config_or_settings, dict):
             self.config = config_or_settings
-        elif config:
-            self.config = config
 
         wc = self.config.get("wind_control", {})
         limits = wc.get("limits", {})
         cadence = wc.get("human_cadence", {})
+        qh_cfg = wc.get("quiet_hours", {})
+        cb_cfg = wc.get("circuit_breaker", {})
 
         self.min_interval = float(
             getattr(self.settings, "MIN_COOLDOWN_SECONDS", wc.get("min_call_interval_seconds", 12.0))
@@ -67,15 +67,27 @@ class WindControlGovernor:
         self.window_1h_max = int(
             getattr(self.settings, "SLIDING_WINDOW_1H_MAX", limits.get("window_1h_max_calls", 30))
         )
+        self.window_24h_max = int(limits.get("window_24h_max_calls", 200))
         self.jitter_min = float(
             getattr(self.settings, "JITTER_MIN_SECONDS", cadence.get("min_jitter_seconds", 1.5))
         )
         self.jitter_max = float(
             getattr(self.settings, "JITTER_MAX_SECONDS", cadence.get("max_jitter_seconds", 4.8))
         )
-        self.quiet_hours_enabled = wc.get("quiet_hours", {}).get("enabled", True)
+        self.quiet_hours_enabled = bool(qh_cfg.get("enabled", True))
+        self.quiet_hours_start = str(
+            getattr(self.settings, "QUIET_HOURS_START", qh_cfg.get("start_time", "01:00"))
+        )
+        self.quiet_hours_end = str(
+            getattr(self.settings, "QUIET_HOURS_END", qh_cfg.get("end_time", "07:00"))
+        )
+        self.lockdown_403_seconds = float(
+            getattr(self.settings, "LOCKDOWN_403_HOURS", 24) * 3600
+            if self.settings is not None
+            else cb_cfg.get("lockdown_403_seconds", 86400)
+        )
         self.backoff_schedule = getattr(
-            self.settings, "COOLDOWN_429_SCHEDULE", [120, 600, 1800]
+            self.settings, "COOLDOWN_429_SCHEDULE", cb_cfg.get("cooldown_429_seconds", [120, 600, 1800])
         )
         self._backoff_index: Dict[str, int] = {}
 
@@ -83,13 +95,23 @@ class WindControlGovernor:
         # ClosingConnection guarantees the FD is released when the `with` block exits.
         return sqlite_connect(self.db_path, timeout=30.0)
 
+    @staticmethod
+    def _parse_hhmm(value: str, fallback: datetime.time) -> datetime.time:
+        try:
+            parts = value.strip().split(":", 1)
+            return datetime.time(int(parts[0]), int(parts[1]))
+        except (ValueError, IndexError):
+            return fallback
+
     def is_quiet_hours(self) -> bool:
         if not self.quiet_hours_enabled:
             return False
         now = datetime.datetime.now().time()
-        start = datetime.time(1, 0)
-        end = datetime.time(7, 0)
-        return start <= now <= end
+        start = self._parse_hhmm(self.quiet_hours_start, datetime.time(1, 0))
+        end = self._parse_hhmm(self.quiet_hours_end, datetime.time(7, 0))
+        if start <= end:
+            return start <= now <= end
+        return now >= start or now <= end
 
     def check_engine_availability(self, engine_id: str, is_p0_urgent: bool = False) -> Tuple[bool, str]:
         """Synchronous per-engine availability check."""
@@ -150,6 +172,15 @@ class WindControlGovernor:
             if count_1h >= self.window_1h_max:
                 return False, f"Engine {engine_id} reached 1-hour rate limit ({count_1h}/{self.window_1h_max})."
 
+            one_day_ago = now - 86400
+            c.execute(
+                "SELECT COUNT(*) FROM wind_control_logs WHERE engine_id = ? AND event_type = 'CALL' AND created_at > ?;",
+                (engine_id, one_day_ago)
+            )
+            count_24h = c.fetchone()[0]
+            if count_24h >= self.window_24h_max:
+                return False, f"Engine {engine_id} reached 24-hour rate limit ({count_24h}/{self.window_24h_max})."
+
         return True, "OK"
 
     async def check_can_invoke(self, is_p0: bool = False, engine_id: str = "agy") -> Tuple[bool, str, float]:
@@ -166,13 +197,28 @@ class WindControlGovernor:
         return ok, reason, wait_time
 
     def record_call(self, engine_id: str = "agy"):
-        """Record successful call in DB."""
+        """Record successful call in DB with daily calendar rollover for total_calls_today."""
         now = time.time()
+        today = datetime.date.fromtimestamp(now)
         with self._get_conn() as conn:
-            conn.execute(
-                "UPDATE engine_health_states SET last_call_timestamp = ?, total_calls_today = total_calls_today + 1 WHERE engine_id = ?;",
-                (now, engine_id)
+            c = conn.cursor()
+            c.execute(
+                "SELECT last_call_timestamp FROM engine_health_states WHERE engine_id = ?;",
+                (engine_id,)
             )
+            row = c.fetchone()
+            last_ts = float(row["last_call_timestamp"] or 0.0) if row else 0.0
+            same_day = last_ts > 0.0 and datetime.date.fromtimestamp(last_ts) == today
+            if same_day:
+                conn.execute(
+                    "UPDATE engine_health_states SET last_call_timestamp = ?, total_calls_today = total_calls_today + 1 WHERE engine_id = ?;",
+                    (now, engine_id)
+                )
+            else:
+                conn.execute(
+                    "UPDATE engine_health_states SET last_call_timestamp = ?, total_calls_today = 1 WHERE engine_id = ?;",
+                    (now, engine_id)
+                )
             conn.execute(
                 "INSERT INTO wind_control_logs (engine_id, event_type, details, created_at) VALUES (?, 'CALL', 'NORMAL_CALL', ?);",
                 (engine_id, now)
@@ -214,8 +260,8 @@ class WindControlGovernor:
         self.trigger_429_backoff(engine_id)
 
     def trigger_403_lockdown(self, engine_id: str = "agy"):
-        """Trigger red 403 24-hour lockdown."""
-        lockdown_duration = 86400.0
+        """Trigger red 403 lockdown using configured duration."""
+        lockdown_duration = self.lockdown_403_seconds
         now = time.time()
         until = now + lockdown_duration
         with self._get_conn() as conn:
@@ -235,7 +281,7 @@ class WindControlGovernor:
 
     async def manual_admin_unlock(self, user_id: str, engine_id: str = "agy") -> Tuple[bool, str]:
         """Manual admin unlock to reset circuit breaker."""
-        admin_users = getattr(self.settings, "ADMIN_USERS", ["admin_user", "*"])
+        admin_users = getattr(self.settings, "ADMIN_USERS", None) or ["admin_user"]
         if "*" not in admin_users and user_id not in admin_users:
             return False, f"Permission denied: user '{user_id}' is not an authorized administrator."
 

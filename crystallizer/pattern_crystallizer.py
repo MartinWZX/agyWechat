@@ -144,13 +144,22 @@ class PatternCrystallizer:
             return existing.get("script_path")
 
         canonical_answer = answers[-1]
+        slots = self.extract_slots(query)
+        has_slots = any(bool(v) for v in slots.values())
+        if has_slots:
+            distinct_answers = {a.strip() for a in answers if a and a.strip()}
+            slot_tokens = [tok for vals in slots.values() for tok in vals if len(tok) >= 2]
+            embeds_slot = any(tok in canonical_answer for tok in slot_tokens)
+            if len(distinct_answers) > 1 or embeds_slot:
+                return None
+
         script_code = (
             f'"""Auto-synthesized & EvalHarness-verified L0 skill for pattern {fp_hash}."""\n'
             f"RESPONSE = {json.dumps(canonical_answer, ensure_ascii=False)}\n\n"
             f"def run(query: str = '', slots=None, **kwargs) -> str:\n"
             f"    return RESPONSE\n"
         )
-        report = EvalHarness.evaluate_script(script_code, sample_queries=[query], sample_slots=[self.extract_slots(query)])
+        report = EvalHarness.evaluate_script(script_code, sample_queries=[query], sample_slots=[slots])
         if not report.passed:
             self.store.log_hallucination(rule_name, "eval_harness", "EVAL_REJECTED", report.reason)
             return None
@@ -243,7 +252,7 @@ class PatternCrystallizer:
             f"                'payload': {{'load_1m': load1, 'disk_percent': disk_pct, 'status': 'SPIKE_DETECTED'}}}}\n"
             f"    return f\"【主动定时巡检】'{script_name}' 执行正常: Load={{load1:.2f}}, Disk={{disk_pct}}% (0 Token)。\"\n"
         )
-        report = EvalHarness.evaluate_script(code, sample_queries=[raw_sample])
+        report = EvalHarness.evaluate_script(code, sample_queries=[raw_sample], check_determinism=False)
         if not report.passed:
             raise ValueError(f"Periodic cron script failed EvalHarness: {report.reason}")
 
@@ -263,6 +272,7 @@ class PatternCrystallizer:
         job_entry = {
             "id": script_name,
             "name": f"周期任务_{raw_sample[:15]}",
+            "raw_sample": raw_sample,
             "cron": cron_expr,
             "schedule": cron_expr,
             "script": script_name,
@@ -282,54 +292,72 @@ class PatternCrystallizer:
             f"后续将由代码按时自动执行并汇报，无需再消耗大模型算力。"
         )
 
-    def crystallize_from_response(self, text_response: str, auto_promote: bool = True) -> Optional[str]:
-        """Extract `<crystallize_script>` tag from model response, run EvalHarness, and persist."""
-        match = re.search(
-            r'<crystallize_script\s+name="([^"]+)"(?:\s+trigger_regex="([^"]*)")?'
-            r'(?:\s+voice_homophones="([^"]*)")?(?:\s+cron_expr="([^"]*)")?>\s*(.*?)\s*</crystallize_script>',
-            text_response,
-            re.DOTALL,
-        )
-        if not match:
-            return None
-
-        script_name = match.group(1).strip()
-        trigger_regex = (match.group(2) or "").strip()
-        voice_homophones = (match.group(3) or "").strip()
-        cron_expr = (match.group(4) or "").strip()
-        script_code = match.group(5).strip()
-
-        report = EvalHarness.evaluate_script(script_code, sample_queries=[script_name])
-        if not report.passed:
-            self.store.log_hallucination("crystallize", "all", "SHADOW_DRY_RUN_FAILED", report.reason)
-            return None
-
-        script_path = os.path.join(self.scripts_dir, f"{script_name}.py")
-        with open(script_path, "w", encoding="utf-8") as f:
-            f.write(script_code + "\n")
-
-        status = "active" if (auto_promote and bool(trigger_regex)) else "candidate"
-        self.repo.upsert_rule(
-            script_name,
-            script_path=script_path,
-            status=status,
-            pattern_regex=trigger_regex,
-            voice_homophones=voice_homophones,
-            fingerprint=script_name,
-            fingerprint_hash=self.get_pattern_hash(script_name),
-            response_template=report.sample_output,
-            source="model_crystallize_tag",
-        )
-
-        if cron_expr and cron_expr != "auto":
-            self.solidify_periodic_cron(
-                {
-                    "fingerprint": script_name,
-                    "raw_sample": script_name,
-                    "occurrence_count": 3,
-                    "mean_interval_sec": 3600,
-                    "suggested_cron": cron_expr,
-                },
-                script_code=script_code,
+    def crystallize_from_response(
+        self,
+        text_response: str,
+        auto_promote: bool = True,
+        normalizer: Any = None,
+    ) -> Optional[str]:
+        """Extract `<crystallize_script>` tags from model response, run EvalHarness, and persist."""
+        tag_matches = list(
+            re.finditer(
+                r"<crystallize_script\s+([^>]+)>\s*(.*?)\s*</crystallize_script>",
+                text_response,
+                re.DOTALL,
             )
-        return script_path
+        )
+        if not tag_matches:
+            return None
+
+        last_script_path: Optional[str] = None
+        for tag_m in tag_matches:
+            attr_str = tag_m.group(1)
+            script_code = tag_m.group(2).strip()
+            attrs = dict(re.findall(r'([a-zA-Z_]+)\s*=\s*["\']([^"\']*)["\']', attr_str))
+            script_name = attrs.get("name", "").strip()
+            if not script_name:
+                continue
+            trigger_regex = attrs.get("trigger_regex", "").strip()
+            voice_homophones = attrs.get("voice_homophones", "").strip()
+            cron_expr = attrs.get("cron_expr", "").strip()
+
+            report = EvalHarness.evaluate_script(script_code, sample_queries=[script_name])
+            if not report.passed:
+                self.store.log_hallucination("crystallize", "all", "SHADOW_DRY_RUN_FAILED", report.reason)
+                continue
+
+            script_path = os.path.join(self.scripts_dir, f"{script_name}.py")
+            with open(script_path, "w", encoding="utf-8") as f:
+                f.write(script_code + "\n")
+
+            status = "active" if (auto_promote and bool(trigger_regex)) else "candidate"
+            self.repo.upsert_rule(
+                script_name,
+                script_path=script_path,
+                status=status,
+                pattern_regex=trigger_regex,
+                voice_homophones=voice_homophones,
+                fingerprint=script_name,
+                fingerprint_hash=self.get_pattern_hash(script_name),
+                response_template=report.sample_output,
+                source="model_crystallize_tag",
+            )
+            if voice_homophones and normalizer is not None and hasattr(normalizer, "learn_homophone"):
+                target_cmd = f"#{script_name}" if not trigger_regex else script_name
+                for alias in re.split(r"[,，|;；\s]+", voice_homophones):
+                    if alias.strip():
+                        normalizer.learn_homophone(alias.strip(), target_cmd)
+
+            if cron_expr and cron_expr != "auto":
+                self.solidify_periodic_cron(
+                    {
+                        "fingerprint": script_name,
+                        "raw_sample": script_name,
+                        "occurrence_count": 3,
+                        "mean_interval_sec": 3600,
+                        "suggested_cron": cron_expr,
+                    },
+                    script_code=script_code,
+                )
+            last_script_path = script_path
+        return last_script_path

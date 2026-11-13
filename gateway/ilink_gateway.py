@@ -1,8 +1,10 @@
 """Tencent iLink Bot Pusher, ContextTokenStore & Long-Polling Gateway Worker."""
 import asyncio
+from collections import OrderedDict
 import json
 import logging
 from pathlib import Path
+import time
 from typing import Any, Dict, Optional
 
 import httpx
@@ -95,29 +97,39 @@ class ILinkPusher:
 
         base_url = self.settings.WEIXIN_BASE_URL or ILINK_DEFAULT_BASE_URL
         context_token = self.token_store.get(user_id)
+        chunks = [c for c in self.splitter.split(content) if c.strip()] or ([content] if content else [])
+        if not chunks:
+            return True
 
         try:
-            resp = await ILinkAPIClient.send_message(
-                token=token,
-                to_user_id=user_id,
-                text=content,
-                context_token=context_token,
-                base_url=base_url,
-                client=self.client,
-            )
-            ret = resp.get("ret")
-            errcode = resp.get("errcode")
-            if (ret in (-14, -2) or errcode in (-14, -2)) and context_token:
-                logger.warning("iLink session stale for %s; retrying without context_token...", user_id)
-                self.token_store.remove(user_id)
-                await ILinkAPIClient.send_message(
+            for chunk in chunks:
+                resp = await ILinkAPIClient.send_message(
                     token=token,
                     to_user_id=user_id,
-                    text=content,
-                    context_token=None,
+                    text=chunk,
+                    context_token=context_token,
                     base_url=base_url,
                     client=self.client,
                 )
+                ret = resp.get("ret")
+                errcode = resp.get("errcode")
+                if (ret in (-14, -2) or errcode in (-14, -2)) and context_token:
+                    logger.warning("iLink session stale for %s; retrying without context_token...", user_id)
+                    self.token_store.remove(user_id)
+                    context_token = None
+                    resp = await ILinkAPIClient.send_message(
+                        token=token,
+                        to_user_id=user_id,
+                        text=chunk,
+                        context_token=None,
+                        base_url=base_url,
+                        client=self.client,
+                    )
+                    ret = resp.get("ret")
+                    errcode = resp.get("errcode")
+                if (ret is not None and ret != 0) or (errcode is not None and errcode != 0):
+                    logger.warning("iLink sendmessage returned error for %s: %s", user_id, resp)
+                    return False
             return True
         except Exception as e:
             logger.error("Failed to send iLink message to %s: %s", user_id, e)
@@ -132,11 +144,41 @@ class ILinkGatewayWorker:
         self.router = router
         root_dir = Path(__file__).resolve().parent.parent
         self.token_store = token_store or ContextTokenStore(root_dir / ".context_tokens.json")
+        self._sync_buf_path = self.token_store.storage_path.with_suffix(".sync_buf")
         self.pusher = ILinkPusher(settings=settings, token_store=self.token_store)
         self._running = False
         self._task: Optional[asyncio.Task] = None
-        self._sync_buf = ""
+        self._sync_buf = self._load_sync_buf()
+        self._seen_msg_ids: "OrderedDict[str, float]" = OrderedDict()
         self.active_user: Optional[str] = None
+
+    def _load_sync_buf(self) -> str:
+        try:
+            if self._sync_buf_path.is_file():
+                return self._sync_buf_path.read_text(encoding="utf-8").strip()
+        except OSError as err:
+            logger.debug("Failed to load iLink sync_buf: %s", err)
+        return ""
+
+    def _save_sync_buf(self, value: str) -> None:
+        if not value or value == self._sync_buf:
+            return
+        self._sync_buf = value
+        try:
+            self._sync_buf_path.write_text(value, encoding="utf-8")
+        except OSError as err:
+            logger.debug("Failed to persist iLink sync_buf: %s", err)
+
+    def _is_duplicate_msg(self, msg_id: str) -> bool:
+        if not msg_id:
+            return False
+        now = time.time()
+        if msg_id in self._seen_msg_ids and (now - self._seen_msg_ids[msg_id]) < 600.0:
+            return True
+        self._seen_msg_ids[msg_id] = now
+        while len(self._seen_msg_ids) > 512:
+            self._seen_msg_ids.popitem(last=False)
+        return False
 
     def is_authorized(self, user_id: str) -> bool:
         if "*" in self.settings.ALLOWED_USERS:
@@ -193,7 +235,7 @@ class ILinkGatewayWorker:
                     if data.get("ret", 0) != 0:
                         await asyncio.sleep(2)
                         continue
-                    self._sync_buf = str(data.get("get_updates_buf") or self._sync_buf)
+                    self._save_sync_buf(str(data.get("get_updates_buf") or self._sync_buf))
                     for msg in data.get("msgs") or []:
                         await self._handle_message(msg)
                 except asyncio.CancelledError:
@@ -209,6 +251,9 @@ class ILinkGatewayWorker:
         context_token = str(msg.get("context_token") or "").strip()
         if not from_user:
             return
+        dedup_id = str(msg.get("msg_id") or msg.get("client_id") or "").strip()
+        if self._is_duplicate_msg(dedup_id):
+            return
         if context_token:
             self.token_store.set(from_user, context_token)
 
@@ -216,6 +261,8 @@ class ILinkGatewayWorker:
         for item in msg.get("item_list") or []:
             if item.get("type") == 1 and "text_item" in item:
                 text_content += item["text_item"].get("text", "")
+            elif "voice_item" in item and isinstance(item["voice_item"], dict):
+                text_content += str(item["voice_item"].get("text") or item["voice_item"].get("recognition") or "")
         text_content = text_content.strip()
         if not text_content:
             return

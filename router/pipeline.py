@@ -38,6 +38,7 @@ class RouteDecision:
     tier: str = "T3_COGNITIVE"
     preferred_engine: Optional[str] = None
     effective_query: str = ""
+    base_query: str = ""
 
 
 class SemanticCache:
@@ -206,7 +207,9 @@ class DeterministicRouter:
                 return RouteDecision(
                     False,
                     tier="T3_FEEDBACK_RETRY",
+                    preferred_engine=last_ctx.get("preferred_engine") or None,
                     effective_query=f"{orig_query}（用户反馈上一次回答有误，请重新核实并严谨回答）",
+                    base_query=orig_query,
                 )
             return RouteDecision(True, "已记录纠错并降级对应缓存/规则，请重发您的具体问题。", tier="T0_FEEDBACK")
 
@@ -254,26 +257,56 @@ class DeterministicRouter:
                     "rule_name": rule_name,
                     "query": eff_query,
                     "fingerprint": fp,
+                    "preferred_engine": pref_engine or "",
                 }
                 return RouteDecision(
                     True, reply_str, tier=f"T1_SKILL:{rule_name}",
-                    preferred_engine=pref_engine, effective_query=eff_query,
+                    preferred_engine=pref_engine, effective_query=eff_query, base_query=eff_query,
                 )
 
-            # Sandbox runtime failure -> degrade rule & trigger background self-healing
+            # Sandbox runtime failure -> degrade rule & trigger self-healing; re-run healed skill immediately if recovered
             err_msg = sres.error_summary()
             logger.warning("Active skill '%s' failed (%s); degrading & scheduling self-heal.", rule_name, err_msg)
             self.repo.record_rule_failure(rule_name)
             self.repo.set_rule_status(rule_name, "degraded")
             if self.rsi_engine and self.hub:
-                await self.rsi_engine.run_self_healing_cycle(script_path, err_msg, self.hub, rule_name=rule_name)
+                healed = await self.rsi_engine.run_self_healing_cycle(
+                    script_path, err_msg, self.hub, rule_name=rule_name, priority=0
+                )
+                if healed:
+                    retry_res = await run_file_async(
+                        script_path,
+                        entrypoint="run",
+                        kwargs={"query": eff_query, "slots": slots},
+                        timeout=10.0,
+                    )
+                    if retry_res.ok and retry_res.result is not None and str(retry_res.result).strip():
+                        reply_str = str(retry_res.result).strip()
+                        self.repo.record_rule_hit(rule_name)
+                        self._last_served_by_user[user_id] = {
+                            "rule_name": rule_name,
+                            "query": eff_query,
+                            "fingerprint": fp,
+                            "preferred_engine": pref_engine or "",
+                        }
+                        return RouteDecision(
+                            True, reply_str, tier=f"T1_SKILL_HEALED:{rule_name}",
+                            preferred_engine=pref_engine, effective_query=eff_query, base_query=eff_query,
+                        )
 
         # Tier-2: Stage-adaptive semantic cache (skip when user explicitly requested a specific @engine)
         if pref_engine is None:
             cached_ans = self.cache.lookup(eff_query, fp, similarity_threshold=cache_theta)
             if cached_ans:
-                self._last_served_by_user[user_id] = {"rule_name": "", "query": eff_query, "fingerprint": fp}
-                return RouteDecision(True, cached_ans, tier="T2_CACHE", effective_query=eff_query)
+                self._last_served_by_user[user_id] = {
+                    "rule_name": "",
+                    "query": eff_query,
+                    "fingerprint": fp,
+                    "preferred_engine": "",
+                }
+                return RouteDecision(True, cached_ans, tier="T2_CACHE", effective_query=eff_query, base_query=eff_query)
 
         # Tier-3: Escalate to Cognitive CLI
-        return RouteDecision(False, tier="T3_COGNITIVE", preferred_engine=pref_engine, effective_query=eff_query)
+        return RouteDecision(
+            False, tier="T3_COGNITIVE", preferred_engine=pref_engine, effective_query=eff_query, base_query=eff_query
+        )

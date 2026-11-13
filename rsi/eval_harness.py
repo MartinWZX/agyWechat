@@ -70,6 +70,7 @@ class EvalHarness:
         sample_queries: Sequence[str],
         sample_slots: Sequence[Dict[str, Any]] = (),
         min_output_chars: int = 2,
+        check_determinism: bool = True,
     ) -> EvalReport:
         try:
             ShadowDryRunValidator.validate_script(script_code, timeout=8.0)
@@ -83,7 +84,11 @@ class EvalHarness:
             kwargs = {"query": query, "slots": slots}
             try:
                 res1 = run_code_sync(script_code, entrypoint="run", kwargs=kwargs, timeout=8.0)
-                res2 = run_code_sync(script_code, entrypoint="run", kwargs=kwargs, timeout=8.0)
+                res2 = (
+                    run_code_sync(script_code, entrypoint="run", kwargs=kwargs, timeout=8.0)
+                    if check_determinism
+                    else res1
+                )
             except SandboxExecutionError as err:
                 return EvalReport(False, 0.0, f"Sandbox security rejection: {err}")
 
@@ -96,7 +101,7 @@ class EvalHarness:
                 return EvalReport(False, 0.0, "Output empty or shorter than minimum threshold.")
             if any(marker in out1 for marker in PLACEHOLDER_MARKERS):
                 return EvalReport(False, 0.1, "Output contains unpromoted placeholder banner.")
-            if out1 != out2:
+            if check_determinism and out1 != out2:
                 return EvalReport(False, 0.3, "Non-deterministic output detected across identical runs.")
             last_output = out1
 

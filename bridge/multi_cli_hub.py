@@ -1,5 +1,6 @@
 """Multi-CLI Hub with Bounded Concurrency (<=2), Priority Slot Queue, EWMA Routing & Anti-Hallucination Audit."""
 import asyncio
+import datetime
 import json
 import logging
 import re
@@ -137,13 +138,53 @@ class MultiCLIHub:
         priority: int = 0,
         preferred_engine: Optional[str] = None,
         allowed_scope: Optional[List[str]] = None,
+        auto_apply_rsi_hooks: bool = True,
     ) -> Tuple[bool, str, str]:
         """Execute task with bounded concurrency (<=2), priority slot scheduling, and physical audit."""
         await self.slot_gate.acquire(priority=priority)
         try:
-            return await self._execute_with_failover(prompt, raw_manifest, priority, preferred_engine, allowed_scope)
+            return await self._execute_with_failover(
+                prompt,
+                raw_manifest,
+                priority,
+                preferred_engine,
+                allowed_scope,
+                auto_apply_rsi_hooks=auto_apply_rsi_hooks,
+            )
         finally:
             self.slot_gate.release()
+
+    def _is_daily_budget_exhausted(self) -> Tuple[bool, int, str]:
+        """Check current RSI stage daily_llm_budget against today's recorded CLI calls."""
+        if not self.evolution_engine or not hasattr(self.evolution_engine, "phase_controller"):
+            return False, 0, ""
+        if not self.store or not hasattr(self.store, "_get_connection"):
+            return False, 0, ""
+        policy = self.evolution_engine.phase_controller.get_stage_policy()
+        today_start = datetime.datetime.combine(datetime.date.today(), datetime.time.min).timestamp()
+        with self.store._get_connection() as conn:
+            c = conn.cursor()
+            c.execute(
+                "SELECT COUNT(*) FROM wind_control_logs WHERE event_type = 'CALL' AND created_at >= ?;",
+                (today_start,),
+            )
+            calls_today = int(c.fetchone()[0])
+        if calls_today >= policy.daily_llm_budget:
+            return True, policy.daily_llm_budget, policy.stage.value
+        return False, policy.daily_llm_budget, policy.stage.value
+
+    async def _run_driver_once(
+        self,
+        driver: BaseCLIAgentDriver,
+        mode: str,
+        prompt: str,
+    ) -> Tuple[int, str, str, float]:
+        t0 = time.monotonic()
+        if mode == "pty":
+            returncode, stdout, stderr = await driver.execute_pty(prompt, self.workspace_dir)
+        else:
+            returncode, stdout, stderr = await driver.execute_one_liner(prompt, self.workspace_dir)
+        return returncode, stdout, stderr, (time.monotonic() - t0) * 1000.0
 
     async def _execute_with_failover(
         self,
@@ -152,9 +193,15 @@ class MultiCLIHub:
         priority: int,
         preferred_engine: Optional[str],
         allowed_scope: Optional[List[str]],
+        auto_apply_rsi_hooks: bool = True,
     ) -> Tuple[bool, str, str]:
+        budget_exceeded, budget_limit, stage_name = await asyncio.to_thread(self._is_daily_budget_exhausted)
+        if budget_exceeded:
+            return False, f"BUDGET_EXCEEDED: Daily LLM budget ({budget_limit}) reached for stage {stage_name}.", "NONE"
+
         engines_to_try = self._rank_candidates(preferred_engine)
         last_error = ""
+        strict_manifest = bool(self.config.get("anti_hallucination", {}).get("strict_manifest_check", True))
 
         for engine_id in engines_to_try:
             is_avail, reason = self.governor.check_engine_availability(engine_id, is_p0_urgent=(priority == 0))
@@ -166,69 +213,83 @@ class MultiCLIHub:
             driver = self.drivers[engine_id]
             mode = self.config.get("engines", {}).get(engine_id, {}).get("mode", "one_liner")
 
-            async with self._audit_lock:
-                pre_snap = self.snapshot_differ.take_snapshot()
-                t0 = time.monotonic()
-                if mode == "pty":
-                    returncode, stdout, stderr = await driver.execute_pty(prompt, self.workspace_dir)
-                else:
-                    returncode, stdout, stderr = await driver.execute_one_liner(prompt, self.workspace_dir)
-                elapsed_ms = (time.monotonic() - t0) * 1000.0
-                self.governor.record_call(engine_id)
+            local_differ = WorkspaceSnapshotDiffer(
+                self.workspace_dir, ignore_patterns=self.snapshot_differ.ignore_patterns
+            )
+            if strict_manifest:
+                async with self._audit_lock:
+                    pre_snap = await asyncio.to_thread(local_differ.take_snapshot)
+                    returncode, stdout, stderr, elapsed_ms = await self._run_driver_once(driver, mode, prompt)
+                    await asyncio.to_thread(self.governor.record_call, engine_id)
+            else:
+                pre_snap = await asyncio.to_thread(local_differ.take_snapshot)
+                returncode, stdout, stderr, elapsed_ms = await self._run_driver_once(driver, mode, prompt)
+                await asyncio.to_thread(self.governor.record_call, engine_id)
 
-                failure = classify_cli_failure(returncode, stdout, stderr)
-                if failure == FailureKind.RATE_LIMIT_429:
-                    self._record_ewma(engine_id, False, elapsed_ms)
-                    self.governor.trigger_429_backoff(engine_id)
-                    last_error = f"Engine {engine_id} triggered anchored 429 rate limit."
-                    continue
+            failure = classify_cli_failure(returncode, stdout, stderr)
+            if failure == FailureKind.RATE_LIMIT_429:
+                self._record_ewma(engine_id, False, elapsed_ms)
+                self.governor.trigger_429_backoff(engine_id)
+                last_error = f"Engine {engine_id} triggered anchored 429 rate limit."
+                continue
 
-                if failure == FailureKind.LOCKDOWN_403:
-                    self._record_ewma(engine_id, False, elapsed_ms)
-                    self.governor.trigger_403_lockdown(engine_id)
-                    last_error = f"Engine {engine_id} triggered anchored 403 RED LOCKDOWN."
-                    continue
+            if failure == FailureKind.LOCKDOWN_403:
+                self._record_ewma(engine_id, False, elapsed_ms)
+                self.governor.trigger_403_lockdown(engine_id)
+                last_error = f"Engine {engine_id} triggered anchored 403 RED LOCKDOWN."
+                continue
 
-                if failure == FailureKind.EXEC_ERROR:
-                    self._record_ewma(engine_id, False, elapsed_ms)
-                    last_error = f"Engine {engine_id} returned exit code {returncode}: {stderr}"
-                    continue
+            if failure == FailureKind.EXEC_ERROR:
+                self._record_ewma(engine_id, False, elapsed_ms)
+                last_error = f"Engine {engine_id} returned exit code {returncode}: {stderr}"
+                continue
 
-                post_snap = self.snapshot_differ.take_snapshot()
-                manifest_match = re.search(r"<execution_manifest>(.*?)</execution_manifest>", stdout, re.DOTALL)
-                parsed_manifest: Dict[str, Any] = {"files_created": [], "files_modified": [], "commands_executed": []}
-                if manifest_match:
-                    try:
-                        parsed_manifest = json.loads(manifest_match.group(1).strip())
-                    except ValueError as parse_err:
-                        logger.debug("Execution manifest parse error: %s", parse_err)
-
+            manifest_match = re.search(r"<execution_manifest>(.*?)</execution_manifest>", stdout, re.DOTALL)
+            parsed_manifest: Dict[str, Any] = {"files_created": [], "files_modified": [], "commands_executed": []}
+            if manifest_match:
                 try:
-                    self.snapshot_differ.audit_manifest(pre_snap, post_snap, parsed_manifest, allowed_scope=allowed_scope)
-                    ok_logic, reason_logic = LogicalConsistencyVerifier.verify(raw_manifest, stdout)
-                    if not ok_logic:
-                        raise ValueError(reason_logic)
-                except Exception as audit_err:
-                    self._record_ewma(engine_id, False, elapsed_ms)
-                    if self.store and hasattr(self.store, "log_hallucination"):
-                        self.store.log_hallucination(
-                            str(raw_manifest.get("manifest_hash", "task"))[:16],
-                            engine_id,
-                            type(audit_err).__name__,
-                            str(audit_err),
-                            reverted=True,
-                        )
-                    last_error = f"Anti-hallucination check failed on engine {engine_id}: {audit_err}"
-                    continue
+                    parsed_manifest = json.loads(manifest_match.group(1).strip())
+                except ValueError as parse_err:
+                    logger.debug("Execution manifest parse error: %s", parse_err)
+
+            try:
+                if strict_manifest:
+                    post_snap = await asyncio.to_thread(local_differ.take_snapshot)
+                    await asyncio.to_thread(
+                        local_differ.audit_manifest,
+                        pre_snap,
+                        post_snap,
+                        parsed_manifest,
+                        allowed_scope=allowed_scope,
+                    )
+                ok_logic, reason_logic = LogicalConsistencyVerifier.verify(raw_manifest, stdout)
+                if not ok_logic:
+                    raise ValueError(reason_logic)
+            except Exception as audit_err:
+                self._record_ewma(engine_id, False, elapsed_ms)
+                if self.store and hasattr(self.store, "log_hallucination"):
+                    self.store.log_hallucination(
+                        str(raw_manifest.get("manifest_hash", "task"))[:16],
+                        engine_id,
+                        type(audit_err).__name__,
+                        str(audit_err),
+                        reverted=True,
+                    )
+                last_error = f"Anti-hallucination check failed on engine {engine_id}: {audit_err}"
+                continue
 
             self._record_ewma(engine_id, True, elapsed_ms)
-            self._apply_post_execution_rsi_hooks(stdout)
+            if auto_apply_rsi_hooks:
+                self._apply_post_execution_rsi_hooks(stdout)
             return True, stdout, engine_id
 
         return False, f"All engines failed. Last error: {last_error}", "NONE"
 
     def _apply_post_execution_rsi_hooks(self, stdout: str) -> None:
         """Automatically harvest tool mutations, skill precipitations, and crystallized scripts."""
+        auto_promote = True
+        if self.evolution_engine and hasattr(self.evolution_engine, "phase_controller"):
+            auto_promote = self.evolution_engine.phase_controller.get_stage_policy().auto_promote_verified
         if self.evolution_engine and hasattr(self.evolution_engine, "process_model_rsi_patches"):
             try:
                 self.evolution_engine.process_model_rsi_patches(stdout)
@@ -236,6 +297,6 @@ class MultiCLIHub:
                 logger.warning("RSI patch harvesting failed: %s", exc)
         if self.crystallizer and hasattr(self.crystallizer, "crystallize_from_response"):
             try:
-                self.crystallizer.crystallize_from_response(stdout)
+                self.crystallizer.crystallize_from_response(stdout, auto_promote=auto_promote)
             except Exception as exc:
                 logger.warning("Crystallize-from-response hook failed: %s", exc)

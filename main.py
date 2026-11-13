@@ -14,6 +14,7 @@ from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import PlainTextResponse
+import httpx
 
 from bridge.multi_cli_hub import MultiCLIHub
 from config import Settings, get_settings, load_yaml_config
@@ -123,6 +124,20 @@ ilink_worker: Optional[ILinkGatewayWorker] = (
 async def _push_cron_notification(target_user: str, text: str) -> None:
     if ilink_worker is not None:
         await ilink_worker.pusher.send_raw(target_user, text)
+    elif settings.WECHAT_PUSH_URL and "127.0.0.1:8000/mock/" not in settings.WECHAT_PUSH_URL:
+        headers = {"Content-Type": "application/json"}
+        secret = settings.WECHAT_BOT_SECRET.get_secret_value()
+        if secret:
+            headers["X-Bot-Secret"] = secret
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                await client.post(
+                    settings.WECHAT_PUSH_URL,
+                    json={"to_user": target_user, "content": text},
+                    headers=headers,
+                )
+        except httpx.HTTPError as exc:
+            logger.warning("[Cron Push -> %s] Webhook push failed: %s", target_user, exc)
     else:
         logger.info("[Cron Push -> %s] %s", target_user, text)
 
@@ -133,6 +148,7 @@ scheduler = CodeFirstCronScheduler(
     push_message_func=_push_cron_notification,
     settings=settings,
     rsi_engine=rsi_engine,
+    health_monitor=monitor,
 )
 _seen_msg_ids: "OrderedDict[str, float]" = OrderedDict()
 

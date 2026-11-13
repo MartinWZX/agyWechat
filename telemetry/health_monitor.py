@@ -39,10 +39,11 @@ class HealthMonitor:
 
     def get_offload_rate(self) -> float:
         """Calculate deterministic code offload rate: (L0 + Cron) / Total."""
-        total = self.l0_intercepted + self.agy_invocations
+        offloaded = self.l0_intercepted + self.cron_stage1_executed
+        total = offloaded + self.agy_invocations
         if total == 0:
             return 100.0 if self.total_incoming == 0 else 0.0
-        return round((self.l0_intercepted / total) * 100.0, 1)
+        return round((offloaded / total) * 100.0, 1)
 
     async def generate_status_report(self) -> str:
         """Generate formatted WeChat status report card."""
