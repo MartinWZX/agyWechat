@@ -1,5 +1,7 @@
 # Autonomous Multi-CLI Agent (Code-First, LLM-Last)
 
+[简体中文](README.md) | [English](docs/README_EN.md)
+
 基于 **“代码优先、大模型兜底（Code-First, LLM-Last）”** 架构范式的生产级多智能体 CLI 统一编排系统。原生对接 Google `agy`、Pi `pi`、Claude Code `claude`、Oh-My-Pi `omp`，默认开启 `dangerously-skip-permissions` 全自主免确认执行，内置四维反幻觉物理校验与微信原生语音识别直提。
 
 ---
@@ -12,18 +14,19 @@
 agyWechat/
 ├── main.py                      # 全局唯一单进程主入口（flock 锁、FastAPI 与总线初始化）
 ├── config.py                    # 统一配置桥接器（Pydantic Settings + YAML 加载）
-├── config.yaml                  # 生产级核心配置（CLI 路径、风控阈值、同音字表）
+├── config.yaml                  # 生产级核心配置（CLI 路径、安全阈值、同音字表）
 ├── run.sh                       # 宿主机一键启动脚本
 ├── requirements.txt             # Python 核心依赖清单
 ├── .env / .env.example          # 环境配置与示例
 │
-├── AGENTS.md                    # 跨引擎统一主控规范（防幻觉、防 429 铁律）
+├── AGENTS.md                    # 跨引擎统一主控规范（反幻觉与安全执行铁律）
 ├── GEMINI.md                    # -> 供 Google agy 启动读取
 ├── CLAUDE.md                    # -> 供 Claude Code 启动读取
 │
 ├── docs/                        # 📚 项目架构与设计文档归档
 │   ├── ARCHITECTURE.md          # 详细系统架构白皮书
-│   └── PROJECT_INTRODUCTION.md  # 项目背景与演进介绍
+│   ├── PROJECT_INTRODUCTION.md  # 项目背景与演进介绍
+│   └── README_EN.md             # English README（英文版说明文档）
 │
 ├── scripts/                     # 🛠️ 运维部署与登录工具脚本
 │   └── login_wechat.py          # 微信登录交互脚本（腾讯官方 iLink 扫码）
@@ -42,8 +45,8 @@ agyWechat/
 ├── scheduler/                   # 模块 3：二段式代码优先定时调度器
 │   ├── code_first_cron.py       # Stage-1 纯代码 + Stage-2 认知唤醒
 │   └── jobs.json                # 定时任务注册表
-├── guard/                       # 模块 4：多引擎独立风控守卫（Anti-429 / Anti-403）
-│   └── wind_control_governor.py # 滑动窗口限流、拟人延迟与三态熔断
+├── guard/                       # 模块 4：多引擎独立安全护卫（配额限流与熔断保护）
+│   └── wind_control_governor.py # 滑动窗口限流、调度安全节流与三态熔断保护
 ├── bridge/                      # 模块 5：多智能体 CLI 桥接中心与 Failover 路由
 │   ├── multi_cli_hub.py         # 优先级调度与跨引擎热备切换
 │   └── drivers/                 # CLI 原生驱动实现
@@ -62,9 +65,9 @@ agyWechat/
 ├── tools/                       # 模块 9：确定性工具注册表与 Trace 审计
 │   └── tool_registry.py         # 工具执行记录与 Python/CLI/MCP 双模直调
 ├── sandbox/                     # 模块 10：AST 沙盒安全守卫与微信 L1-L5 审批流
-│   └── approval_guard.py        # 危险命令阻断与高危操作微信确认
+│   └── approval_guard.py        # 危险命令阻断与高危操作微信安全确认
 ├── telemetry/                   # 模块 11：全链路可观测性与运行看板
-│   └── health_monitor.py        # 纯代码卸载率与风控看板
+│   └── health_monitor.py        # 纯代码卸载率与安全运行看板
 ├── verifier/                    # 模块 12：全链路四维反幻觉确定性审计引擎
 │   └── hallucination_guard.py   # 物理快照差分、逻辑自洽与影子实测校验
 └── rsi/                         # 模块 13：RSI 递归自演进总控引擎
@@ -76,6 +79,6 @@ agyWechat/
 ## ⚡ 核心设计原则
 
 1. **根目录极致清爽**：根目录仅保留入口文件（`main.py`）、主配置文件（`config.yaml`）、环境定义（`.env`）与主控规范（`AGENTS.md`），所有辅助文件、文档、旧版代码与部署资产均归整入专用子目录。
-2. **纯代码卸载率 $\ge 90\%$**：常规查询与高频微信语音/文字消息经由 L0 规则拦截，100% 由本地 Python 脚本毫秒级处理，0 Token 消耗，彻底消除 429 风控与幻觉。
+2. **纯代码卸载率 $\ge 90\%$（设计目标）**：常规查询与高频微信语音/文字消息经由 L0 规则拦截，由本地 Python 脚本确定性快速处理，降低 Token 消耗并保障高并发安全稳定与零幻觉输出。
 3. **物理反幻觉闭环**：通过物理状态前后快照差分（Git / Hash Diff），拦截“说多做少”与“说少做多”（自动回滚越权篡改）。
 4. **单行式与常驻 PTY 双模调度**：支持 `agy`、`pi`、`claude`、`omp` 官方二进制驱动，自动注入 `--dangerously-skip-permissions` 免确认执行。
