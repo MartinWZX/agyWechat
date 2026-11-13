@@ -17,11 +17,12 @@ class PreFlightGate:
     """Hardcoded pre-flight gate ensuring deterministic tasks are physically blocked from LLM CLIs."""
 
     DETERMINISTIC_PREFIXES = [
-        "#状态", "状态", "查看状态", "系统状态",
-        "#风控看板", "风控看板", "#风控",
-        "#幻觉审计", "幻觉审计",
-        "#规则", "#演进看板",
-        "#help", "帮助", "使用说明",
+        "/status",
+        "/security", "/defense", "/dashboard",
+        "/audit",
+        "/rules", "/evolution", "/rsi",
+        "/engines",
+        "/help",
     ]
 
     @classmethod
@@ -32,10 +33,11 @@ class PreFlightGate:
         data_payload: Optional[Dict[str, Any]] = None,
     ) -> Tuple[bool, str]:
         """Validate if task genuinely requires cognitive reasoning or is strictly deterministic."""
-        clean_query = user_query.strip()
+        raw_query = user_query.strip()
+        clean_query = raw_query.lower()
         for prefix in cls.DETERMINISTIC_PREFIXES:
             if clean_query == prefix or clean_query.startswith(prefix + " "):
-                return False, f"Task '{clean_query}' is strictly deterministic (L0 Code). Bypassing LLM."
+                return False, f"Task '{raw_query}' is strictly deterministic (L0 Code). Bypassing LLM."
 
         if not isinstance(reason, InvocationReason):
             return False, f"Invalid InvocationReason: {reason}."
@@ -124,7 +126,10 @@ class CognitiveGate:
         episodic_memories: Optional[List[Dict[str, Any]]] = None,
         tools_summary: Optional[str] = None,
     ) -> str:
-        sections: List[str] = [f"[TASK_INSTRUCTION]\n{task_instruction.strip()}"]
+        stripped_task = task_instruction.strip()
+        sections: List[str] = [
+            stripped_task if stripped_task.startswith("/") else f"[TASK_INSTRUCTION]\n{stripped_task}"
+        ]
 
         if session_history:
             trimmed = [
@@ -158,4 +163,29 @@ class CognitiveGate:
             "</execution_manifest>\n"
             "<final_conclusion>\n(User-facing concise summary)\n</final_conclusion>"
         )
+        return "\n\n".join(sections) + "\n"
+
+    def compress_coding_context(
+        self,
+        task_instruction: str,
+        workspace_dir: str = "",
+        session_history: Optional[List[Dict[str, str]]] = None,
+        has_native_session: bool = False,
+    ) -> str:
+        """Build clean interactive coding prompt preserving leading /slash and native thread state."""
+        stripped_task = task_instruction.strip()
+        if stripped_task.startswith("/") and (has_native_session or not session_history):
+            return stripped_task
+
+        sections: List[str] = [stripped_task]
+        if not has_native_session and session_history:
+            trimmed = [
+                f"- Q: {item['q'][:160]} -> A: {item['a'][:200]}"
+                for item in session_history[-3:]
+                if item.get("q")
+            ]
+            if trimmed:
+                sections.append("[RECENT_SESSION_WINDOW]\n" + "\n".join(trimmed))
+        if workspace_dir and not stripped_task.startswith("/"):
+            sections.append(f"[WORKSPACE_DIR]\n{workspace_dir}")
         return "\n\n".join(sections) + "\n"

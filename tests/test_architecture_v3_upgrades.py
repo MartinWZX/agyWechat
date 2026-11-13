@@ -123,17 +123,17 @@ def test_s5_webhook_signature_auth_idempotency_and_safe_admin_default(tmp_path: 
     assert "*" not in default_s.ADMIN_USERS
 
     guard = ApprovalGuard(settings=default_s)
-    denied = asyncio.run(guard.handle_approval_response("random_stranger", "确认 act_123"))
+    denied = asyncio.run(guard.handle_approval_response("random_stranger", "/approve act_123"))
     assert "权限不足" in denied
 
     allowed_sender = (
-        "u1" if "*" in app_settings.ALLOWED_USERS else app_settings.ALLOWED_USERS[0]
+        "u1" if "*" in app_settings.ADMIN_USERS else app_settings.ALLOWED_USERS[0]
     )
 
     with TestClient(app) as client:
         bad_resp = client.post(
             "/wechat/webhook?signature=deadbeef&timestamp=1700000000&nonce=abc",
-            json={"from_user": allowed_sender, "content": "#状态", "msg_id": "sig_bad_1"},
+            json={"from_user": allowed_sender, "content": "/status", "msg_id": "sig_bad_1"},
         )
         assert bad_resp.status_code == 403
 
@@ -141,7 +141,7 @@ def test_s5_webhook_signature_auth_idempotency_and_safe_admin_default(tmp_path: 
         sig = compute_wechat_signature(token, "1700000001", "nonce42")
         good_resp = client.post(
             f"/wechat/webhook?signature={sig}&timestamp=1700000001&nonce=nonce42",
-            json={"from_user": allowed_sender, "content": "#状态", "msg_id": "sig_ok_1"},
+            json={"from_user": allowed_sender, "content": "/status", "msg_id": "sig_ok_1"},
         )
         assert good_resp.status_code == 200
 
@@ -238,6 +238,12 @@ async def test_p1_governed_rsi_closed_loop_negative_feedback_and_self_healing(tm
     cli_bin = _make_real_cli_script(
         tmp_path / "smart_cli.py",
         "import sys\n"
+        "if '--version' in sys.argv:\n"
+        "    print('smart-claude 2.0.0')\n"
+        "    sys.exit(0)\n"
+        "if '--help' in sys.argv:\n"
+        "    print('Slash commands:\\n  /plan  Create plan')\n"
+        "    sys.exit(0)\n"
         f"cf = {str(counter_file)!r}\n"
         "n = int(open(cf).read().strip()) + 1\n"
         "open(cf, 'w').write(str(n))\n"
@@ -276,10 +282,16 @@ async def test_p1_governed_rsi_closed_loop_negative_feedback_and_self_healing(tm
         crystallizer=cryst, skill_manager=sm, health_monitor=mon, settings=s, rsi_engine=rsi,
     )
 
-    # 3 parameterized variations of the same structural question (bypass cache via @claude to exercise CLI synthesis)
-    r1 = await gw.process_inbound_message("u1", "@claude 查询节点 10.0.0.1 的标准监听端口")
-    r2 = await gw.process_inbound_message("u1", "@claude 查询节点 10.0.0.2 的标准监听端口")
-    r3 = await gw.process_inbound_message("u1", "@claude 查询节点 10.0.0.3 的标准监听端口")
+    # Non-engine default state blocks business queries & direct engine+task invocation before /claude entry
+    blocked = await gw.process_inbound_message("u1", "查询节点 10.0.0.1 的标准监听端口")
+    assert "非引擎默认状态" in blocked
+    entered = await gw.process_inbound_message("u1", "/claude")
+    assert "已进入 [CLAUDE]" in entered and "/plan" in entered
+
+    # 3 parameterized variations of the same structural question inside claude engine
+    r1 = await gw.process_inbound_message("u1", "查询节点 10.0.0.1 的标准监听端口")
+    r2 = await gw.process_inbound_message("u1", "查询节点 10.0.0.2 的标准监听端口")
+    r3 = await gw.process_inbound_message("u1", "查询节点 10.0.0.3 的标准监听端口")
     assert r1 == "生产环境标准监听端口为 8000，备份端口为 8001。"
     assert "<facts_anchor>" not in r1  # C1: raw XML tags stripped on async path!
     cli_calls["count"] = int(counter_file.read_text(encoding="utf-8"))

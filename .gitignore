@@ -134,6 +134,7 @@ Thumbs.db
 # 6. 项目专有运行态令牌、锁文件与动态演化快照
 # ==========================================
 .context_tokens.json
+.context_tokens.sync_buf
 wechat_qr.png
 tools/tool_execution_trace.jsonl
 *.lock

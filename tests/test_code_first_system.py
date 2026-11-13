@@ -141,7 +141,7 @@ async def test_approval_guard_ast_and_interactive(test_settings):
     async def simulate_admin_approval():
         await asyncio.sleep(0.1)
         action_id = list(guard._pending_futures.keys())[0]
-        reply = await guard.handle_approval_response("admin_user", f"确认 {action_id}")
+        reply = await guard.handle_approval_response("admin_user", f"/approve {action_id}")
         assert "已由管理员" in reply
 
     task = asyncio.create_task(simulate_admin_approval())
@@ -176,8 +176,8 @@ def run(name="World"):
 @pytest.mark.asyncio
 async def test_cognitive_gate_admission_and_compression():
     """Verify hardcoded pre-flight gate and token-minimized context assembly."""
-    # 1. Deterministic task rejected
-    ok_det, msg_det = PreFlightGate.validate_admission(InvocationReason.INFO_SYNTHESIS, "#状态", None)
+    # 1. Deterministic task rejected (all commands use English / prefix)
+    ok_det, msg_det = PreFlightGate.validate_admission(InvocationReason.INFO_SYNTHESIS, "/status", None)
     assert not ok_det
     assert "strictly deterministic" in msg_det
 
@@ -273,16 +273,16 @@ async def test_wechat_gateway_l0_interception(test_settings):
         settings=test_settings,
     )
 
-    # 1. System command #状态 intercepted at L0
-    resp_status = await gateway.process_inbound_message("test_user", "#状态")
+    # 1. System command /status intercepted at L0
+    resp_status = await gateway.process_inbound_message("test_user", "/status")
     assert "Google agy 微信智能体运行看板" in resp_status
 
-    # 2. System command #风控看板 intercepted at L0
-    resp_wind = await gateway.process_inbound_message("test_user", "#风控看板")
+    # 2. System command /security intercepted at L0
+    resp_wind = await gateway.process_inbound_message("test_user", "/security")
     assert "五维防御看板" in resp_wind
 
     # 3. Help manual intercepted at L0
-    resp_help = await gateway.process_inbound_message("test_user", "#help")
+    resp_help = await gateway.process_inbound_message("test_user", "/help")
     assert "WeChat-AGY 系统帮助手册" in resp_help
 
     # Verify 0 agy invocations were made for all three queries
@@ -358,10 +358,10 @@ def test_fastapi_endpoints(test_settings):
         assert resp_root.status_code == 200
         assert resp_root.json()["system"] == "WeChat-AGY Autonomous Agent"
 
-        # Webhook endpoint with L0 command #状态
+        # Webhook endpoint with L0 command /status
         payload = {
             "from_user": "test_wechat_user@im.wechat",
-            "content": "#状态",
+            "content": "/status",
             "msg_id": "msg_001"
         }
         resp_wh = client.post("/wechat/webhook", json=payload)
@@ -372,3 +372,39 @@ def test_fastapi_endpoints(test_settings):
         resp_health = client.get("/health")
         assert resp_health.status_code == 200
         assert "offload_rate" in resp_health.json()
+
+
+def test_legacy_db_timestamps_migration_and_slash_only_commands(tmp_path):
+    """Verify legacy interaction_patterns table migrates timestamps_json and commands require '/' prefix."""
+    import sqlite3
+    from gateway.wechat_gateway import RuleMatcher
+    from memory.rsi_repository import RSIRepository
+
+    db_file = str(tmp_path / "legacy.db")
+    conn = sqlite3.connect(db_file)
+    conn.execute(
+        "CREATE TABLE interaction_patterns ("
+        "fingerprint TEXT PRIMARY KEY, raw_sample TEXT, occurrence_count INTEGER DEFAULT 1, "
+        "last_seen REAL, crystallized INTEGER DEFAULT 0, answers_json TEXT DEFAULT '[]', "
+        "cron_proposed INTEGER DEFAULT 0)"
+    )
+    conn.commit()
+    conn.close()
+
+    store = CoreStateStore(db_path=db_file)
+    repo = RSIRepository(store)
+    count, timestamps = repo.observe_pattern("fp_hello", "你好", 1700000000.0)
+    assert count == 1 and len(timestamps) == 1
+    store.close()
+
+    for non_slash in [
+        "#状态", "状态", "#help", "帮助", "@pi", "风控看板",
+        "/状态", "/安全看板", "/风控看板", "/幻觉审计", "/规则", "/帮助", "/确认",
+        "/defense", "/dashboard", "/evolution", "/rsi", "/cd",
+    ]:
+        assert not RuleMatcher.match(non_slash)[0], f"Unexpected command match for {non_slash}"
+    for slash_cmd in [
+        "/status", "/security", "/audit", "/rules", "/engines", "/help",
+        "/pi", "/claude", "/agy", "/omp",
+    ]:
+        assert RuleMatcher.match(slash_cmd)[0], f"Missing slash command match for {slash_cmd}"

@@ -26,37 +26,40 @@ class RuleMatcher:
 
     @classmethod
     def match(cls, text: str, db_path: str = "memory/agent_core.db") -> Tuple[bool, str]:
-        t = text.strip()
-        if t in ["#状态", "状态", "查看状态", "系统状态"]:
+        cmd = text.strip().lower()
+        if cmd == "/status":
             return True, f"Google agy 微信智能体运行看板\n{run_status()}"
-        if t in ["#风控看板", "风控看板", "#风控"]:
+        if cmd == "/security":
             return True, f"五维防御看板\n{run_dashboard(db_path=db_path)}"
-        if t in ["#幻觉审计", "幻觉审计"]:
+        if cmd == "/audit":
             return True, run_audit(db_path=db_path)
-        if t in ["#规则", "#演进", "#rsi"]:
+        if cmd == "/rules":
             return True, "请通过网关主路由查看 RSI 演进看板。"
-        if t in ["#help", "帮助", "使用说明"]:
+        if cmd == "/engines":
+            return True, "已配置引擎：/agy, /pi, /claude, /omp"
+        if cmd == "/help":
             return True, (
-                "WeChat-AGY 系统帮助手册：\n"
-                "1. 查看状态：发送 '#状态' 或语音 '查看状态'\n"
-                "2. 风控看板：发送 '#风控看板' 或语音 '风控看板'\n"
-                "3. 幻觉审计：发送 '#幻觉审计' | 演进治理：发送 '#规则'\n"
-                "4. 定向引擎：@pi, @claude, @agy, @omp"
+                "WeChat-AGY 系统帮助手册（所有命令均以 / 开头，且无重复别名）：\n"
+                "1. 工作目录：/workspace <路径> | /pwd | /ls\n"
+                "2. 状态与安全：/status | /engines | /security | /audit | /rules\n"
+                "3. 进入引擎：/agy | /pi | /claude | /omp（退出请用 /exit）"
             )
-        if t == "@pi":
+        if cmd == "/pi":
             return True, "已收到针对 Pi 引擎的定向指令。"
-        if t == "@claude":
+        if cmd == "/claude":
             return True, "已收到针对 Claude 引擎的定向指令。"
-        if t == "@agy":
+        if cmd == "/agy":
             return True, "已收到针对 Agy 引擎的定向指令。"
-        if t == "@omp":
+        if cmd == "/omp":
             return True, "已收到针对 OMP 引擎的定向指令。"
         return False, ""
 
 
 def _extract_final_conclusion(raw_answer: str) -> str:
-    match = re.search(r"<final_conclusion>(.*?)</final_conclusion>", raw_answer, re.DOTALL)
-    return match.group(1).strip() if match else raw_answer.strip()
+    body, sep, diff_tail = raw_answer.partition("\n\n📁 本轮真实文件变更")
+    match = re.search(r"<final_conclusion>(.*?)(?:</final_conclusion>|$)", body, re.DOTALL)
+    clean = match.group(1).strip() if match else body.strip()
+    return f"{clean}{sep}{diff_tail}".strip() if sep else clean
 
 
 class WeChatGateway:
@@ -106,6 +109,7 @@ class WeChatGateway:
             approval_guard=self.approval_guard,
             hub=self.hub,
             settings=self.settings,
+            config=self.config,
         )
         self._load_rule_homophones()
         self.active_user: Optional[str] = None
@@ -118,8 +122,9 @@ class WeChatGateway:
                 continue
             target = str(rule.get("rule_name") or "").strip()
             for alias in re.split(r"[,，|;；\s]+", raw_vh):
-                if alias.strip() and target:
-                    self.normalizer.learn_homophone(alias.strip(), f"#{target}")
+                clean_target = target.lstrip("/#")
+                if alias.strip() and clean_target and clean_target.isascii():
+                    self.normalizer.learn_homophone(alias.strip(), f"/{clean_target}")
 
     async def handle_message(
         self,
@@ -164,16 +169,16 @@ class WeChatGateway:
 
         eff_query = decision.effective_query or normalized_text
         clean_query = decision.base_query or eff_query
-        is_feedback_retry = decision.tier == "T3_FEEDBACK_RETRY"
+        skip_learning = decision.tier == "T3_FEEDBACK_RETRY" or decision.is_engine_slash
         threshold = int(self.config.get("crystallization", {}).get("faq_solidify_threshold", 3))
-        if not is_feedback_retry:
+        if not skip_learning:
             await self.crystallizer.observe_message(clean_query, threshold=threshold)
 
         # Auto-solidify periodic Cron when CV <= 0.25 and not yet proposed
         auto_cron = bool(self.config.get("crystallization", {}).get("auto_cron_enabled", True))
         fp = self.crystallizer.extract_fingerprint(clean_query)
         cron_notice = ""
-        if auto_cron and not is_feedback_retry:
+        if auto_cron and not skip_learning:
             pat = self.crystallizer.repo.get_pattern(fp)
             if pat and not pat.get("cron_proposed"):
                 p_info = self.crystallizer.detect_periodicity(fp)
@@ -193,38 +198,76 @@ class WeChatGateway:
             )
             return echo_header + final_reply + cron_notice
 
-        session_hist = self.store.get_recent_exchanges(user_id, limit=3)
-        memories = await self.store.search_episodic_memory(clean_query, limit=3)
-        tools_summary = ", ".join(
-            f"{s['name']}({s['version']})" for s in ToolRegistry.list_tool_signatures()
+        session_hist = self.store.get_recent_exchanges(
+            user_id, limit=3, since_ts=decision.session_started_at
         )
         manifest = self.gate.build_anchor_manifest({"user_query": {"text": eff_query, "source": msg_type}})
-        compressed_prompt = self.gate.compress_context(
-            eff_query,
-            manifest,
-            session_history=session_hist,
-            episodic_memories=memories,
-            tools_summary=tools_summary,
-        )
-
-        success, answer, engine = await self.hub.execute_task(
-            compressed_prompt,
-            manifest,
-            priority=0,
-            preferred_engine=decision.preferred_engine,
-            auto_apply_rsi_hooks=False,
-        )
+        exec_meta: Dict[str, Any] = {}
+        if decision.coding_mode:
+            if decision.tier.startswith("T3_ENGINE_PANEL:"):
+                compressed_prompt = eff_query
+            else:
+                compressed_prompt = self.gate.compress_coding_context(
+                    eff_query,
+                    workspace_dir=decision.workspace_dir,
+                    session_history=session_hist,
+                    has_native_session=bool(decision.conversation_id and decision.supports_native_session),
+                )
+            success, answer, engine = await self.hub.execute_task(
+                compressed_prompt,
+                manifest,
+                priority=0,
+                preferred_engine=decision.preferred_engine,
+                auto_apply_rsi_hooks=False,
+                strict_engine_pin=decision.strict_engine_pin,
+                require_contract_tags=False,
+                cli_flags=decision.cli_flags or None,
+                workspace_dir=decision.workspace_dir or None,
+                coding_mode=True,
+                session_meta_out=exec_meta,
+            )
+        else:
+            memories = await self.store.search_episodic_memory(clean_query, limit=3)
+            tools_summary = ", ".join(
+                f"{s['name']}({s['version']})" for s in ToolRegistry.list_tool_signatures()
+            )
+            compressed_prompt = self.gate.compress_context(
+                eff_query,
+                manifest,
+                session_history=session_hist,
+                episodic_memories=memories,
+                tools_summary=tools_summary,
+            )
+            success, answer, engine = await self.hub.execute_task(
+                compressed_prompt,
+                manifest,
+                priority=0,
+                preferred_engine=decision.preferred_engine,
+                auto_apply_rsi_hooks=False,
+                strict_engine_pin=decision.strict_engine_pin,
+                require_contract_tags=not decision.is_engine_slash,
+                cli_flags=decision.cli_flags or None,
+                workspace_dir=decision.workspace_dir or None,
+            )
 
         if not success:
             final_reply = f"抱歉，系统暂时无法处理该请求：{answer}"
         else:
             final_reply = _extract_final_conclusion(answer)
+            if not final_reply.strip():
+                final_reply = "✅ 指令执行完成（无额外文本输出）。"
+            has_workspace_mutations = any(bool(v) for v in (exec_meta.get("diff") or {}).values())
+            if decision.coding_mode and not decision.tier.startswith(("T3_ENGINE_BTW:", "T3_ENGINE_PANEL:")):
+                self.det_router.engine_router.record_coding_turn(
+                    user_id, conversation_id=exec_meta.get("conversation_id")
+                )
             policy = self.rsi_engine.phase_controller.get_stage_policy()
-            self.crystallizer.crystallize_from_response(
-                answer, auto_promote=policy.auto_promote_verified, normalizer=self.normalizer
-            )
-            self.rsi_engine.process_model_rsi_patches(answer)
-            if not is_feedback_retry:
+            if not decision.is_engine_slash and not has_workspace_mutations:
+                self.crystallizer.crystallize_from_response(
+                    answer, auto_promote=policy.auto_promote_verified, normalizer=self.normalizer
+                )
+                self.rsi_engine.process_model_rsi_patches(answer)
+            if not skip_learning and not has_workspace_mutations and not decision.conversation_id:
                 self.crystallizer.record_verified_interaction(
                     clean_query,
                     final_reply,

@@ -213,14 +213,14 @@ class ApprovalGuard:
             self._pending_metadata.pop(action_id, None)
 
     async def handle_approval_response(self, user_id: str, message_content: str) -> str:
-        """Handle administrator approval message (e.g. '确认 <action_id>')."""
+        """Handle administrator approval message (e.g. '/approve <action_id>')."""
         admin_users = getattr(self.settings, "ADMIN_USERS", None) or []
         if "*" not in admin_users and user_id not in admin_users:
             return f"权限不足：用户 '{user_id}' 不是管理员，无法审批高危操作。"
 
-        match = re.search(r"(?:#?确认|approve)\s+([a-zA-Z0-9_]+)", message_content.strip())
+        match = re.search(r"^/approve\s+([a-zA-Z0-9_]+)$", message_content.strip(), re.IGNORECASE)
         if not match:
-            return "无效审批指令。格式：'确认 <action_id>' 或 '#确认 <action_id>'。"
+            return "无效审批指令。格式：'/approve <action_id>'。"
 
         action_id = match.group(1).strip()
         future = self._pending_futures.get(action_id)

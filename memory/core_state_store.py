@@ -35,10 +35,8 @@ class CoreStateStore:
             # 1. Sessions & Messages
             cursor.execute("""
             CREATE TABLE IF NOT EXISTS working_sessions (
-                session_id TEXT PRIMARY KEY,
-                user_id TEXT,
-                created_at REAL,
-                updated_at REAL
+                session_id TEXT PRIMARY KEY, user_id TEXT, created_at REAL, updated_at REAL,
+                active_engine TEXT DEFAULT '', engine_commands_json TEXT DEFAULT '[]', engine_meta_json TEXT DEFAULT '{}', workspace_dir TEXT DEFAULT ''
             );""")
             cursor.execute("""
             CREATE TABLE IF NOT EXISTS messages (
@@ -171,17 +169,19 @@ class CoreStateStore:
                 "reply_content": "TEXT DEFAULT ''", "engine_used": "TEXT DEFAULT 'UNKNOWN'",
                 "offloaded": "INTEGER DEFAULT 0",
             })
+            self._ensure_columns(cursor, "working_sessions", {
+                "active_engine": "TEXT DEFAULT ''", "engine_commands_json": "TEXT DEFAULT '[]'",
+                "engine_meta_json": "TEXT DEFAULT '{}'", "workspace_dir": "TEXT DEFAULT ''",
+            })
             self._ensure_columns(cursor, "crystallized_rules", {
-                "status": "TEXT DEFAULT 'candidate'",
-                "fingerprint": "TEXT DEFAULT ''",
-                "fingerprint_hash": "TEXT DEFAULT ''",
-                "response_template": "TEXT DEFAULT ''",
-                "fail_count": "INTEGER DEFAULT 0",
-                "source": "TEXT DEFAULT 'auto'",
-                "updated_at": "REAL DEFAULT 0",
+                "status": "TEXT DEFAULT 'candidate'", "fingerprint": "TEXT DEFAULT ''",
+                "fingerprint_hash": "TEXT DEFAULT ''", "response_template": "TEXT DEFAULT ''",
+                "fail_count": "INTEGER DEFAULT 0", "source": "TEXT DEFAULT 'auto'", "updated_at": "REAL DEFAULT 0",
             })
             self._ensure_columns(cursor, "interaction_patterns", {
-                "answers_json": "TEXT DEFAULT '[]'",
+                "raw_sample": "TEXT DEFAULT ''", "occurrence_count": "INTEGER DEFAULT 1",
+                "last_seen": "REAL DEFAULT 0", "crystallized": "INTEGER DEFAULT 0",
+                "answers_json": "TEXT DEFAULT '[]'", "timestamps_json": "TEXT DEFAULT '[]'",
                 "cron_proposed": "INTEGER DEFAULT 0",
             })
 
@@ -291,14 +291,14 @@ class CoreStateStore:
             cursor.execute("SELECT * FROM crystallized_rules WHERE status != 'retired' ORDER BY id DESC;")
             return [dict(r) for r in cursor.fetchall()]
 
-    def get_recent_exchanges(self, user_id: str, limit: int = 3) -> List[Dict[str, str]]:
-        """Return the last `limit` (question, answer) pairs for a user, oldest first."""
+    def get_recent_exchanges(self, user_id: str, limit: int = 3, since_ts: float = 0.0) -> List[Dict[str, str]]:
+        """Return the last `limit` (question, answer) pairs for a user after `since_ts`, oldest first."""
         with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(
                 "SELECT normalized_content, reply_content FROM messages "
-                "WHERE user_id = ? AND reply_content != '' ORDER BY created_at DESC LIMIT ?;",
-                (user_id, limit)
+                "WHERE user_id = ? AND reply_content != '' AND created_at >= ? ORDER BY created_at DESC LIMIT ?;",
+                (user_id, float(since_ts or 0.0), limit),
             )
             rows = cursor.fetchall()
         return [{"q": r["normalized_content"] or "", "a": r["reply_content"] or ""} for r in reversed(rows)]

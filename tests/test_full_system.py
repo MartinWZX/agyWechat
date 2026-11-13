@@ -32,11 +32,11 @@ class TestAutonomousMultiCLISystem(unittest.TestCase):
         # Test filler removal & homophone correction
         raw = "呃 那个 请问 帮我 丰控看板"
         norm = vn.normalize(raw)
-        self.assertEqual(norm, "#风控看板")
+        self.assertEqual(norm, "/security")
 
         raw_pi = "爱特派 执行系统健康检查"
         norm_pi = vn.normalize(raw_pi)
-        self.assertTrue(norm_pi.startswith("@pi"))
+        self.assertTrue(norm_pi.startswith("/pi"))
 
     def test_02_voice_pre_inference_sanity(self):
         valid, msg = PreInferenceDataValidator.validate_wechat_voice("啊 呃 嗯")
@@ -46,14 +46,14 @@ class TestAutonomousMultiCLISystem(unittest.TestCase):
 
     def test_03_l0_zero_token_interceptor(self):
         gw = WeChatGateway(self.config)
-        # Status command L0 test
-        res = gw.process_incoming_message("msg_test_01", "user_01", "text", "#状态")
+        # Status command L0 test (requires English / prefix)
+        res = gw.process_incoming_message("msg_test_01", "user_01", "text", "/status")
         self.assertIn("【系统运行状态】", res)
 
         # Risk dashboard L0 test via voice
         xml = "<xml><Recognition><![CDATA[呃 丰控看板]]></Recognition><MediaId><![CDATA[m123]]></MediaId><Format><![CDATA[amr]]></Format></xml>"
         res_voice = gw.process_incoming_message("msg_test_02", "user_01", "voice", xml)
-        self.assertIn("#风控看板", res_voice)
+        self.assertIn("/security", res_voice)
         self.assertIn("【🛡️ 多引擎风控与运行看板】", res_voice)
 
     def test_04_anti_hallucination_under_execution(self):

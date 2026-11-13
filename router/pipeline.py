@@ -1,6 +1,5 @@
-"""Four-Tier Deterministic Routing DAG with Active RSI Skill Matching, Semantic Cache & Negative-Feedback Degradation."""
+"""Four-Tier Deterministic Routing DAG with Two-State Engine FSM, Active RSI Skills & Negative-Feedback Degradation."""
 from collections import OrderedDict
-from dataclasses import dataclass
 import logging
 import re
 import time
@@ -9,12 +8,10 @@ from typing import Any, Dict, Optional, Tuple
 from crystallizer.pattern_crystallizer import PatternCrystallizer
 from memory.core_state_store import CoreStateStore
 from memory.rsi_repository import RSIRepository
+from router.engine_session_router import EngineSessionRouter, RouteDecision
 from rsi.eval_harness import char_ngram_similarity
 from rsi.evolution_engine import EvolutionEngine
 from sandbox.runner import run_file_async
-from skills.scripts.hallucination_audit import run_audit
-from skills.scripts.system_status import run_status
-from skills.scripts.wind_control_dashboard import run_dashboard
 from tools.tool_registry import ToolRegistry
 
 logger = logging.getLogger("wechat_agy.router")
@@ -24,21 +21,9 @@ MUTATION_INTENT_RE = re.compile(
     re.IGNORECASE,
 )
 NEGATIVE_FEEDBACK_RE = re.compile(
-    r"^(?:#?纠错|#?退回|不对|错了|答错了|答非所问|结果不对|重新回答|重来)[！!。，,\s]*$",
+    r"^(?:不对|错了|答错了|答非所问|结果不对|重新回答|重来)[！!。，,\s]*$",
     re.IGNORECASE,
 )
-APPROVAL_CMD_RE = re.compile(r"^(?:#?确认|approve)\s+[a-zA-Z0-9_]+$", re.IGNORECASE)
-DIRECTED_ENGINE_RE = re.compile(r"^@(pi|claude|agy|omp)(?:\s+(.*))?$", re.IGNORECASE | re.DOTALL)
-
-
-@dataclass
-class RouteDecision:
-    handled: bool
-    reply: str = ""
-    tier: str = "T3_COGNITIVE"
-    preferred_engine: Optional[str] = None
-    effective_query: str = ""
-    base_query: str = ""
 
 
 class SemanticCache:
@@ -110,6 +95,7 @@ class DeterministicRouter:
         hub: Any = None,
         settings: Any = None,
         semantic_cache: Optional[SemanticCache] = None,
+        config: Optional[Dict[str, Any]] = None,
     ):
         self.store = store
         self.repo = RSIRepository(store)
@@ -119,6 +105,7 @@ class DeterministicRouter:
         self.hub = hub
         self.settings = settings
         self.cache = semantic_cache or SemanticCache()
+        self.engine_router = EngineSessionRouter(store=store, hub=hub, config=config, settings=settings)
         self._last_served_by_user: Dict[str, Dict[str, str]] = {}
 
     def _is_admin(self, user_id: str) -> bool:
@@ -139,60 +126,41 @@ class DeterministicRouter:
             f"• 确定性工具数: {tools_cnt}"
         )
 
-    def match_tier0_command(self, text: str) -> Tuple[bool, str, Optional[str], str]:
-        """Return (handled, reply, preferred_engine, effective_query)."""
+    def match_tier0_command(self, text: str, user_id: str = "default") -> Tuple[bool, str, Optional[str], str]:
+        """Match read-only Non-Engine view commands."""
         t = text.strip()
-        db_path = self.store.db_path
-
-        if t in ["#状态", "状态", "查看状态", "系统状态"]:
-            return True, f"Google agy 微信智能体运行看板\n{run_status()}", None, t
-        if t in ["#风控看板", "风控看板", "#风控"]:
-            return True, f"五维防御看板\n{run_dashboard(db_path=db_path)}", None, t
-        if t in ["#幻觉审计", "幻觉审计"]:
-            return True, run_audit(db_path=db_path), None, t
-        if t in ["#规则", "#演进", "#rsi"]:
-            return True, self._render_rsi_rules_board(), None, t
-        if t in ["#help", "帮助", "使用说明"]:
-            return True, (
-                "WeChat-AGY 系统帮助手册：\n"
-                "1. 查看状态：发送 '#状态' 或语音 '查看状态'\n"
-                "2. 风控看板：发送 '#风控看板' 或语音 '风控看板'\n"
-                "3. 幻觉审计：发送 '#幻觉审计' | 演进治理：发送 '#规则'\n"
-                "4. 定向引擎：'@pi <任务>' / '@claude <任务>' / '@agy <任务>' / '@omp <任务>'"
-            ), None, t
-
-        m_dir = DIRECTED_ENGINE_RE.match(t)
-        if m_dir:
-            eng = m_dir.group(1).lower()
-            remainder = (m_dir.group(2) or "").strip()
-            if not remainder:
-                label = {"pi": "Pi", "claude": "Claude", "agy": "Agy", "omp": "OMP"}[eng]
-                return True, f"已收到针对 {label} 引擎的定向指令。", eng, ""
-            return False, "", eng, remainder
-
+        handled, reply = self.engine_router.match_non_engine_view_command(
+            t, rsi_board_fn=self._render_rsi_rules_board, user_id=user_id
+        )
+        if handled:
+            return True, reply, None, t
         return False, "", None, t
 
     async def route(self, user_id: str, normalized_text: str) -> RouteDecision:
-        """Execute 4-tier deterministic routing pipeline."""
+        """Execute Two-State Engine FSM + Tier-1/Tier-2/Tier-3 routing pipeline."""
         t = normalized_text.strip()
+        state = self.engine_router.get_session_state(user_id)
+        active_engine = state["active_engine"]
 
-        # 0a. Interactive L4/L5 admin approval commands
-        if self.approval_guard and APPROVAL_CMD_RE.match(t):
-            reply = await self.approval_guard.handle_approval_response(user_id, t)
-            return RouteDecision(True, reply, tier="T0_APPROVAL", effective_query=t)
+        if not active_engine:
+            return await self.engine_router.route_non_engine(
+                user_id, t, rsi_board_fn=self._render_rsi_rules_board
+            )
 
-        # 0b. Admin rule lifecycle commands (#激活规则 / #停用规则)
-        if t.startswith("#激活规则 ") or t.startswith("#停用规则 "):
-            if not self._is_admin(user_id):
-                return RouteDecision(True, "⛔ 权限不足：仅管理员可变更固化规则状态。", tier="T0_ADMIN")
-            parts = t.split(maxsplit=1)
-            rname = parts[1].strip() if len(parts) > 1 else ""
-            new_status = "active" if t.startswith("#激活规则") else "degraded"
-            changed = self.repo.set_rule_status(rname, new_status)
-            msg = f"规则 '{rname}' 已更新为 {new_status}。" if changed else f"未找到规则 '{rname}'。"
-            return RouteDecision(True, msg, tier="T0_ADMIN", effective_query=t)
+        in_eng_decision = await self.engine_router.route_in_engine(user_id, t, state)
+        if in_eng_decision is not None:
+            return in_eng_decision
 
-        # 0c. User negative feedback -> immediate rule degradation + cache eviction + cognitive re-run
+        pref_engine = active_engine
+        eff_query = t
+        meta = state["meta"]
+        session_flags = self.engine_router.build_cli_flags(meta)
+        ws_dir = state.get("workspace_dir") or self.engine_router.workspace_nav.get_workspace(user_id)
+        conv_id = str(meta.get("conversation_id") or "")
+        sess_started = float(meta.get("session_started_at") or 0.0)
+        native_sess = bool((meta.get("session_capabilities") or {}).get("supports_native_session"))
+
+        # Negative conversational feedback inside active engine -> degrade rule + retry on active engine
         if NEGATIVE_FEEDBACK_RE.match(t) and user_id in self._last_served_by_user:
             last_ctx = self._last_served_by_user.pop(user_id)
             rule_name = last_ctx.get("rule_name", "")
@@ -207,16 +175,18 @@ class DeterministicRouter:
                 return RouteDecision(
                     False,
                     tier="T3_FEEDBACK_RETRY",
-                    preferred_engine=last_ctx.get("preferred_engine") or None,
+                    preferred_engine=pref_engine,
                     effective_query=f"{orig_query}（用户反馈上一次回答有误，请重新核实并严谨回答）",
                     base_query=orig_query,
+                    strict_engine_pin=True,
+                    coding_mode=True,
+                    workspace_dir=ws_dir,
+                    conversation_id=conv_id,
+                    session_started_at=sess_started,
+                    supports_native_session=native_sess,
+                    cli_flags=session_flags,
                 )
             return RouteDecision(True, "已记录纠错并降级对应缓存/规则，请重发您的具体问题。", tier="T0_FEEDBACK")
-
-        # Tier-0: Exact commands & @engine prefix parsing
-        t0_hit, t0_reply, pref_engine, eff_query = self.match_tier0_command(t)
-        if t0_hit:
-            return RouteDecision(True, t0_reply, tier="T0_COMMAND", preferred_engine=pref_engine, effective_query=eff_query)
 
         policy = self.rsi_engine.phase_controller.get_stage_policy() if self.rsi_engine else None
         skill_theta = policy.skill_similarity_threshold if policy else 0.82
@@ -262,6 +232,7 @@ class DeterministicRouter:
                 return RouteDecision(
                     True, reply_str, tier=f"T1_SKILL:{rule_name}",
                     preferred_engine=pref_engine, effective_query=eff_query, base_query=eff_query,
+                    strict_engine_pin=True,
                 )
 
             # Sandbox runtime failure -> degrade rule & trigger self-healing; re-run healed skill immediately if recovered
@@ -292,10 +263,11 @@ class DeterministicRouter:
                         return RouteDecision(
                             True, reply_str, tier=f"T1_SKILL_HEALED:{rule_name}",
                             preferred_engine=pref_engine, effective_query=eff_query, base_query=eff_query,
+                            strict_engine_pin=True,
                         )
 
-        # Tier-2: Stage-adaptive semantic cache (skip when user explicitly requested a specific @engine)
-        if pref_engine is None:
+        # Tier-2: Stage-adaptive semantic cache (bypassed inside pinned active engine)
+        if not pref_engine:
             cached_ans = self.cache.lookup(eff_query, fp, similarity_threshold=cache_theta)
             if cached_ans:
                 self._last_served_by_user[user_id] = {
@@ -306,7 +278,18 @@ class DeterministicRouter:
                 }
                 return RouteDecision(True, cached_ans, tier="T2_CACHE", effective_query=eff_query, base_query=eff_query)
 
-        # Tier-3: Escalate to Cognitive CLI
+        # Tier-3: Escalate to Cognitive CLI pinned strictly to active engine
         return RouteDecision(
-            False, tier="T3_COGNITIVE", preferred_engine=pref_engine, effective_query=eff_query, base_query=eff_query
+            False,
+            tier="T3_COGNITIVE",
+            preferred_engine=pref_engine,
+            effective_query=eff_query,
+            base_query=eff_query,
+            strict_engine_pin=True,
+            coding_mode=True,
+            workspace_dir=ws_dir,
+            conversation_id=conv_id,
+            session_started_at=sess_started,
+            supports_native_session=native_sess,
+            cli_flags=session_flags,
         )

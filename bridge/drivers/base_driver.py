@@ -2,10 +2,17 @@
 import abc
 import asyncio
 import fcntl
+import json
 import os
 import shlex
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from bridge.engine_command_discovery import (
+    EngineDiscoveryResult,
+    discover_engine_commands,
+    resolve_binary,
+    run_cli_capture,
+)
 from sandbox.approval_guard import ApprovalGuard, SandboxSecurityError, scrub_environment
 
 
@@ -61,8 +68,8 @@ class BaseCLIAgentDriver(abc.ABC):
         non_prompt_tokens = [tok for tok in cmd if tok != prompt]
         ApprovalGuard.scan_shell_command(" ".join(shlex.quote(t) for t in non_prompt_tokens))
 
-    async def execute_one_liner(self, prompt: str, workspace_dir: str) -> Tuple[int, str, str]:
-        cmd = self.build_one_liner_cmd(prompt)
+    async def _run_cmd(self, cmd: List[str], prompt: str, workspace_dir: str) -> Tuple[int, str, str]:
+        """Execute a single scrubbed non-interactive CLI invocation after blacklist audit."""
         try:
             self._audit_invocation_prefix(cmd, prompt)
         except SandboxSecurityError as sec_err:
@@ -94,6 +101,32 @@ class BaseCLIAgentDriver(abc.ABC):
             await proc.wait()
             return -1, "", f"Execution timed out after {self.timeout}s"
 
+    async def execute_one_liner(self, prompt: str, workspace_dir: str) -> Tuple[int, str, str]:
+        """Execute standard non-interactive CLI prompt."""
+        return await self._run_cmd(self.build_one_liner_cmd(prompt), prompt, workspace_dir)
+
+    async def execute_with_flags(
+        self, prompt: str, workspace_dir: str, extra_flags: Optional[List[str]] = None
+    ) -> Tuple[int, str, str]:
+        """Execute non-interactive prompt with session-configured CLI overrides and resume flags."""
+        cmd = self.build_one_liner_cmd(prompt)
+        allowed_flags = {
+            "--model", "--mode", "--effort", "--agent", "--add-dir",
+            "--output-format", "--conversation", "--resume",
+        }
+        if extra_flags and cmd:
+            validated: List[str] = []
+            idx = 0
+            while idx + 1 < len(extra_flags):
+                flag_name = str(extra_flags[idx]).strip()
+                flag_val = str(extra_flags[idx + 1]).strip()
+                if flag_name in allowed_flags and flag_val:
+                    validated.extend([flag_name, flag_val])
+                idx += 2
+            if validated:
+                cmd = [cmd[0], *validated, *cmd[1:]]
+        return await self._run_cmd(cmd, prompt, workspace_dir)
+
     async def execute_pty(self, prompt: str, workspace_dir: str) -> Tuple[int, str, str]:
         """Single-host serialized execution protected by non-blocking OS flock."""
         os.makedirs(os.path.dirname(self.lock_file), exist_ok=True)
@@ -106,3 +139,87 @@ class BaseCLIAgentDriver(abc.ABC):
                 fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
         finally:
             lock_f.close()
+
+    async def discover_commands(self, workspace_dir: str, timeout: float = 20.0) -> EngineDiscoveryResult:
+        """Query available commands & metadata dynamically from the installed CLI binary."""
+        return await discover_engine_commands(
+            engine_id=self.engine_id,
+            binary_path=self.binary_path,
+            workspace_dir=workspace_dir,
+            env_passthrough=self.env_passthrough,
+            timeout=timeout,
+        )
+
+    async def execute_subcommand(
+        self, args: List[str], workspace_dir: str, timeout: float = 20.0
+    ) -> Tuple[int, str, str]:
+        """Run a verified CLI subcommand (e.g., models/agents/changelog) without LLM wrapping."""
+        resolved = resolve_binary(self.binary_path)
+        if not resolved:
+            return 127, "", f"Binary '{self.binary_path}' not installed on system."
+        return await run_cli_capture(
+            [resolved, *args], workspace_dir, timeout=timeout, env_passthrough=self.env_passthrough
+        )
+
+
+def _format_cli_command_payload(cmd_obj: Dict[str, Any]) -> str:
+    """Format structured JSON `command` panel payloads (e.g. /hooks, /permissions, /agents)."""
+    cname = str(cmd_obj.get("name") or "command").strip()
+    data = cmd_obj.get("data")
+    if isinstance(data, dict):
+        if len(data) == 1:
+            key, val = next(iter(data.items()))
+            if isinstance(val, list):
+                if not val:
+                    return f"[{cname}] {key}: (空)"
+                rows = [
+                    json.dumps(item, ensure_ascii=False) if isinstance(item, dict) else str(item)
+                    for item in val
+                ]
+                return f"[{cname}] {key}:\n" + "\n".join(f"• {row}" for row in rows)
+        return json.dumps(data, ensure_ascii=False, indent=2)
+    return json.dumps(cmd_obj, ensure_ascii=False, indent=2)
+
+
+def extract_engine_json_result(raw_stdout: str) -> Tuple[str, Optional[str]]:
+    """Extract clean text response and native conversation_id from CLI JSON output when present."""
+    stripped = (raw_stdout or "").strip()
+    if not stripped.startswith("{"):
+        return raw_stdout, None
+    try:
+        payload = json.loads(stripped)
+    except ValueError:
+        return raw_stdout, None
+    if not isinstance(payload, dict):
+        return raw_stdout, None
+    conv_id = str(payload.get("conversation_id") or payload.get("session_id") or "").strip() or None
+    body = str(payload.get("response") or payload.get("result") or "")
+    if not body and isinstance(payload.get("command"), dict):
+        body = _format_cli_command_payload(payload["command"])
+    if not body and payload.get("status") in ("SUCCESS", "success"):
+        usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else {}
+        turns = payload.get("num_turns")
+        tokens = usage.get("total_tokens")
+        meta_parts = [p for p in (f"turns={turns}" if turns is not None else "", f"tokens={tokens}" if tokens else "") if p]
+        suffix = f"（{', '.join(meta_parts)}）" if meta_parts else ""
+        body = f"✅ CLI 指令已执行完成{suffix}。"
+    elif not body and payload.get("status") not in (None, "SUCCESS", "success"):
+        body = str(payload.get("error") or raw_stdout)
+    if "response" in payload or "result" in payload or isinstance(payload.get("command"), dict):
+        return body, conv_id
+    return raw_stdout, conv_id
+
+
+def format_workspace_diff_note(diff: Dict[str, Any]) -> str:
+    """Summarize physical file changes made during a coding turn without modifying workspace files."""
+    parts: List[str] = []
+    for label, key in (("新建", "created"), ("修改", "modified"), ("删除", "deleted")):
+        items = sorted(diff.get(key) or ())
+        if items:
+            preview = ", ".join(items[:6])
+            if len(items) > 6:
+                preview += f" 等共{len(items)}个"
+            parts.append(f"{label}: {preview}")
+    if not parts:
+        return ""
+    return "\n\n📁 本轮真实文件变更：" + " | ".join(parts)

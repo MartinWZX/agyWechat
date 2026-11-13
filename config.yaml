@@ -29,8 +29,8 @@ engines:
     mode: "one_liner" # one_liner | pty
     dangerously_skip_permissions_flag: "--dangerously-skip-permissions"
     default_model: "flash"
-    timeout_seconds: 60
-    max_turns: 3
+    timeout_seconds: 180
+    max_turns: 12
     pty_lock_file: "/tmp/agent_core/locks/agy.lock"
 
   pi:
@@ -90,22 +90,23 @@ voice_normalization:
     - "你好"
     - "哎"
   homophone_corrections:
-    "丰控看板": "#风控看板"
-    "封控看板": "#风控看板"
-    "蜂控看板": "#风控看板"
-    "风控看板": "#风控看板"
-    "幻觉审计": "#幻觉审计"
-    "环境审计": "#幻觉审计"
-    "查看状态": "#状态"
-    "系统状态": "#状态"
-    "切换引擎派": "@pi"
-    "切换引擎克劳德": "@claude"
-    "切换引擎阿基": "@agy"
-    "用派执行": "@pi"
-    "爱特派": "@pi"
-    "爱特克劳德": "@claude"
-    "爱特阿基": "@agy"
-    "演进看板": "#状态"
+    "丰控看板": "/security"
+    "封控看板": "/security"
+    "蜂控看板": "/security"
+    "风控看板": "/security"
+    "安全看板": "/security"
+    "幻觉审计": "/audit"
+    "环境审计": "/audit"
+    "查看状态": "/status"
+    "系统状态": "/status"
+    "切换引擎派": "/pi"
+    "切换引擎克劳德": "/claude"
+    "切换引擎阿基": "/agy"
+    "用派执行": "/pi"
+    "爱特派": "/pi"
+    "爱特克劳德": "/claude"
+    "爱特阿基": "/agy"
+    "演进看板": "/rules"
 
 crystallization:
   faq_solidify_threshold: 3
