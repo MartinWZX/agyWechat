@@ -1,22 +1,30 @@
-"""Pi Coding Agent (pi) Driver."""
-from typing import Iterable, List, Optional
+"""Pi Coding Agent (pi) Native CLI Driver."""
+from typing import List
+
 from .base_driver import BaseCLIAgentDriver
 
 
 class PiDriver(BaseCLIAgentDriver):
+    """Native Pi Coding Agent CLI driver."""
+
+    supports_json_output = False
+    conversation_flag = ""
+
     def __init__(
         self,
         binary_path: str = "pi",
         skip_flag: str = "--no-confirm",
-        default_model: str = "light",
-        timeout: int = 45,
-        max_turns: int = 3,
-        lock_file: Optional[str] = None,
-        env_passthrough: Optional[Iterable[str]] = None,
+        default_model: str = "inherit",
+        timeout: int = 0,
+        max_turns: int = 0,
     ):
         super().__init__(
-            "pi", binary_path, skip_flag, default_model, timeout,
-            max_turns=max_turns, lock_file=lock_file, env_passthrough=env_passthrough,
+            "pi",
+            binary_path,
+            skip_flag,
+            default_model,
+            timeout,
+            max_turns=max_turns,
         )
 
     def build_one_liner_cmd(self, prompt: str) -> List[str]:

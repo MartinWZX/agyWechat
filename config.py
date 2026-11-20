@@ -12,6 +12,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
+    """Application settings loaded from `.env` and environment variables."""
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
@@ -45,7 +47,7 @@ class Settings(BaseSettings):
     )
     ADMIN_USERS: List[str] = Field(
         default_factory=lambda: ["admin_user"],
-        description="Explicit admin WeChat user IDs for L4/L5 approval and wind control unlock (never wildcard by default)",
+        description="Explicit admin WeChat user IDs",
     )
 
     # Tencent iLink Bot (Personal WeChat direct login) configuration
@@ -62,43 +64,23 @@ class Settings(BaseSettings):
         description="Tencent iLink API endpoint base URL",
     )
 
-    # Host & Process configuration
+    # Host & Engine binary configuration
     WORKSPACE_ROOT: Path = Field(
         default_factory=lambda: Path.cwd().resolve(),
         description="Root directory for the workspace",
     )
-    AGY_BINARY: str = Field(
-        default="agy",
-        description="Absolute path or command name of the native Google agy binary",
-    )
-    AGY_LOCK_FILE: Path = Field(
-        default=Path("/tmp/agent_core/locks/agy_host.lock"),
-        description="OS file lock to guarantee single persistent agy host process",
-    )
+    AGY_BINARY: str = Field(default="agy", description="Path or command name of the agy CLI")
+    PI_BINARY: str = Field(default="pi", description="Path or command name of the pi CLI")
+    CLAUDE_BINARY: str = Field(default="claude", description="Path or command name of the claude CLI")
+    OMP_BINARY: str = Field(default="omp", description="Path or command name of the omp CLI")
     DB_PATH: Path = Field(
         default=Path("memory/agent_core.db"),
-        description="SQLite database path for state, memory, rules and wind control",
+        description="SQLite database path for working sessions and message history",
     )
-
-    PTY_COLS: int = Field(default=120, description="Virtual PTY columns")
-    PTY_ROWS: int = Field(default=40, description="Virtual PTY rows")
-    DEBOUNCE_SECONDS: float = Field(default=1.5, description="Terminal output debounce buffer interval")
-    MAX_CHUNK_CHARS: int = Field(default=1500, description="Max chunk size for terminal push messages")
-    WECHAT_MAX_MSG_LEN: int = Field(default=2000, description="Maximum characters per WeChat push message")
-
-    # Anti-429 / Anti-403 Wind Control configuration (Iron Law 4)
-    MIN_COOLDOWN_SECONDS: float = Field(default=12.0, description="Minimum cooldown between agy calls (>=12s)")
-    SLIDING_WINDOW_5M_MAX: int = Field(default=6, description="Max calls in 5-minute sliding window (<=6)")
-    SLIDING_WINDOW_1H_MAX: int = Field(default=30, description="Max calls in 1-hour sliding window (<=30)")
-    JITTER_MIN_SECONDS: float = Field(default=1.5, description="Human typing cadence jitter min delay")
-    JITTER_MAX_SECONDS: float = Field(default=4.8, description="Human typing cadence jitter max delay")
-    QUIET_HOURS_START: str = Field(default="01:00", description="Quiet hours start time (HH:MM)")
-    QUIET_HOURS_END: str = Field(default="07:00", description="Quiet hours end time (HH:MM)")
-    COOLDOWN_429_SCHEDULE: List[int] = Field(
-        default_factory=lambda: [120, 600, 1800],
-        description="Exponential backoff steps for 429 rate limit (seconds)",
+    WECHAT_MAX_MSG_LEN: int = Field(
+        default=2000,
+        description="Maximum characters per outbound WeChat message segment",
     )
-    LOCKDOWN_403_HOURS: int = Field(default=24, description="Mandatory lockdown hours on 403 / ToS violation")
 
     # Service Bind
     SERVICE_HOST: str = Field(default="0.0.0.0", description="HTTP service host")
@@ -138,6 +120,57 @@ def _parse_str_list(v: Any, default: List[str]) -> List[str]:
                 return [item.strip() for item in v.split(",") if item.strip()]
         return [item.strip() for item in v.split(",") if item.strip()]
     return list(default)
+
+
+def resolve_setting_or_yaml(
+    settings: Optional[Any],
+    field_name: str,
+    yaml_value: Any,
+    fallback: Any,
+) -> Any:
+    """Resolve config value with precedence: explicit env/.env setting > config.yaml > default."""
+    if settings is not None and field_name in getattr(settings, "model_fields_set", set()):
+        val = getattr(settings, field_name, None)
+        if val is not None and (not isinstance(val, str) or val.strip()):
+            return val
+    if yaml_value is not None and (not isinstance(yaml_value, str) or yaml_value.strip()):
+        return yaml_value
+    if settings is not None and hasattr(settings, field_name):
+        val = getattr(settings, field_name)
+        if val is not None:
+            return val
+    return fallback
+
+
+def resolve_workspace_root(settings: Optional[Any] = None, yaml_config: Optional[Dict[str, Any]] = None) -> str:
+    """Resolve workspace directory honoring explicit WORKSPACE_ROOT > config.yaml > cwd."""
+    sys_cfg = (yaml_config or {}).get("system", {})
+    raw = resolve_setting_or_yaml(settings, "WORKSPACE_ROOT", sys_cfg.get("workspace_dir"), str(Path.cwd().resolve()))
+    return str(Path(str(raw)).expanduser().resolve())
+
+
+def get_engine_binary(
+    engine_id: str,
+    settings: Optional[Any] = None,
+    yaml_config: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Resolve CLI binary for one of the four supported engines."""
+    field_map = {
+        "agy": "AGY_BINARY",
+        "pi": "PI_BINARY",
+        "claude": "CLAUDE_BINARY",
+        "omp": "OMP_BINARY",
+    }
+    engines_cfg = (yaml_config or {}).get("engines", {})
+    eng_cfg = engines_cfg.get(engine_id, {}) if isinstance(engines_cfg, dict) else {}
+    return str(
+        resolve_setting_or_yaml(
+            settings,
+            field_map.get(engine_id, ""),
+            eng_cfg.get("binary") if isinstance(eng_cfg, dict) else None,
+            engine_id,
+        )
+    )
 
 
 @lru_cache()

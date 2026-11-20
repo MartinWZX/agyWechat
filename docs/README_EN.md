@@ -1,84 +1,72 @@
-# Autonomous Multi-CLI Agent (Code-First, LLM-Last)
+# agyWechat — Pure Two-State WeChat Router & Native Four-Engine AI CLI Gateway
 
 [简体中文](../README.md) | [English](README_EN.md)
 
-A production-grade unified multi-agent CLI orchestration system built on the **"Code-First, LLM-Last"** paradigm. It natively integrates Google `agy`, Pi `pi`, Claude Code `claude`, and Oh-My-Pi `omp` with autonomous `dangerously-skip-permissions` execution, four-dimensional physical anti-hallucination verification, and native WeChat voice recognition extraction.
+**agyWechat** is a pure **Two-State Separation WeChat Gateway** (Official Account Webhook + Personal WeChat Tencent iLink Bot) combining a deterministic host/workspace command viewer with 100% zero-intervention native passthrough to four local AI CLI agents: **Google Antigravity (`agy`)**, **Pi (`pi`)**, **Claude Code (`claude`)**, and **Oh-My-Pi (`omp`)**.
+
+Core principle: **Pure text command router outside engines; 100% native AI agent passthrough inside engines** — no gateway TUI/subcommand interception, no entry-time CLI discovery crawlers or PTY probes, no host environment stripping, zero 429/403 circuit-breaking or rate-limit cooldowns, and verbatim ANSI-cleaned stdout/stderr forwarding.
 
 ---
 
-## 📁 Project Layout
-
-The repository root stays strictly minimal, with core domains encapsulated into dedicated modules and auxiliary documentation, scripts, and deployment files organized into subdirectories:
+## 📁 Minimal Project Layout
 
 ```text
 agyWechat/
-├── main.py                      # Single-process host entrypoint (flock lock, FastAPI & hub setup)
-├── config.py                    # Unified configuration bridge (Pydantic Settings + YAML loader)
-├── config.yaml                  # Production core config (CLI paths, security thresholds, homophones)
-├── run.sh                       # One-click host startup script
-├── requirements.txt             # Python dependency manifest
-├── .env / .env.example          # Environment variables and template
+├── main.py                      # Single-instance flock entrypoint, FastAPI Webhook, / & /health, iLink worker lifecycle
+├── config.py                    # Unified Pydantic Settings & YAML loader (.env > config.yaml > defaults)
+├── config.yaml                  # Engine binaries, skip-permission flags, default models & timeouts
+├── run.sh                       # Convenience launcher
+├── requirements.txt             # Core Python dependencies
+├── pytest.ini                   # Pytest configuration
+├── .env.example                 # Environment variable template
+├── AGENTS.md / CLAUDE.md / GEMINI.md # Workspace agent behavior rules
 │
-├── AGENTS.md                    # Cross-engine orchestrator rules (anti-hallucination & execution safety)
-├── GEMINI.md                    # -> Loaded by Google agy at startup
-├── CLAUDE.md                    # -> Loaded by Claude Code at startup
+├── gateway/                     # Dual WeChat channels, native Recognition extraction & terminal cleaning
+│   ├── wechat_gateway.py        # Two-state voice/text boundary & direct native CLI passthrough
+│   ├── ilink_client.py          # Tencent iLink Bot HTTP client (QR login, getupdates, sendmessage)
+│   ├── ilink_gateway.py         # Long-polling iLink worker, thread-safe ContextTokenStore & single-pass chunk pusher
+│   └── terminal_cleaner.py      # ANSICleaner (ANSI/spinner/CR sanitizer) & WeChatSplitter (fence-safe splitter)
 │
-├── docs/                        # 📚 Architecture & design documentation
-│   ├── ARCHITECTURE.md          # Detailed system architecture whitepaper
-│   ├── PROJECT_INTRODUCTION.md  # Project background & evolution guide
-│   └── README_EN.md             # English README
+├── router/                      # Pure two-state finite state machine
+│   ├── pipeline.py              # DeterministicRouter facade (Non-Engine Router <-> In-Engine Passthrough)
+│   ├── engine_session_router.py # EngineSessionRouter (outer commands, instant entry, strictly /exit /clear /help inside)
+│   ├── engine_session_presenter.py  # Presenter helpers for outer help, /engines table, instant welcome & minimal help
+│   └── workspace_navigator.py   # Safe workspace directory validation (blocks /etc, ~/.ssh, etc.)
 │
-├── scripts/                     # 🛠️ Operations & login utilities
-│   └── login_wechat.py          # Interactive WeChat QR login helper (Tencent iLink protocol)
+├── bridge/                      # Direct zero-interception CLI drivers & hub
+│   ├── multi_cli_hub.py         # Direct zero-lockout hub passing native stdout/stderr back verbatim
+│   └── drivers/                 # AgyDriver, PiDriver, ClaudeDriver, OmpDriver -> BaseCLIAgentDriver (os.environ.copy())
 │
-├── deploy/                      # 🚀 Deployment manifests
-│   └── systemd/                 # Sample systemd service unit
-│       └── agy-wechat.service.example
+├── memory/                      # SQLite WAL persistence (strictly 2 core tables)
+│   ├── core_state_store.py      # working_sessions, messages (auto-drops legacy tables/FTS + VACUUM)
+│   ├── engine_session_repository.py # Persisted user engine, workspace & native conversation_id
+│   └── sqlite_utils.py          # Self-closing SQLite WAL connection helper
 │
-├── gateway/                     # Module 1: WeChat dual gateways, voice Recognition & output cleanup
-│   ├── wechat_gateway.py        # Message bus & L0 deterministic rule dispatch
-│   ├── voice_normalizer.py      # Native WeChat voice recognition extraction & homophone mapping
-│   ├── ilink_gateway.py         # Tencent iLink long-polling bot gateway & chunked pusher
-│   └── terminal_cleaner.py      # Terminal ANSI/VT100 cleaner & WeChat message splitter
-├── crystallizer/                # Module 2: Pattern mining & automated skill crystallization
-│   └── pattern_crystallizer.py  # Pattern extraction, slot collision guard & eval admission
-├── scheduler/                   # Module 3: Two-stage code-first Cron scheduler
-│   ├── code_first_cron.py       # Stage-1 deterministic execution + Stage-2 cognitive escalation
-│   └── jobs.json                # Persisted Cron job registry
-├── guard/                       # Module 4: Per-engine security guard (quota & circuit-breaker safety)
-│   └── wind_control_governor.py # Sliding-window rate limiting, safe throttling & tri-state circuit breaker
-├── bridge/                      # Module 5: Multi-CLI hub & failover routing
-│   ├── multi_cli_hub.py         # Priority concurrency gate & cross-engine failover
-│   └── drivers/                 # Native CLI driver implementations
-│       ├── base_driver.py       # Abstract driver contract (one-liner & persistent PTY modes)
-│       ├── agy_driver.py        # agy driver
-│       ├── pi_driver.py         # pi driver
-│       ├── claude_driver.py     # claude driver
-│       └── omp_driver.py        # omp driver
-├── compressor/                  # Module 6: Cognitive admission gate & context compression
-│   └── cognitive_gate.py        # Dirty-input rejection & [DATA_ANCHOR_MANIFEST] assembly
-├── memory/                      # Module 7: SQLite WAL state store & three-tier memory
-│   └── core_state_store.py      # Short-term sessions, FTS5 episodic recall & audit tables
-├── skills/                      # Module 8: Four-tier skill manager & L0 deterministic scripts
-│   ├── skill_manager.py         # Skill loader & lifecycle promoter
-│   └── scripts/                 # Deterministic Python utility scripts (status, dashboard, audit)
-├── tools/                       # Module 9: Deterministic tool registry & trace auditing
-│   └── tool_registry.py         # Out-of-process sandboxed tools, AST checks & trace logging
-├── sandbox/                     # Module 10: AST sandbox security guard & L1-L5 approval flow
-│   └── approval_guard.py        # Dangerous command blocking & WeChat safety confirmation
-├── telemetry/                   # Module 11: End-to-end observability & runtime dashboard
-│   └── health_monitor.py        # Code offload metrics & security health dashboard
-├── verifier/                    # Module 12: Four-dimensional anti-hallucination verification engine
-│   └── hallucination_guard.py   # SHA-256 snapshot differ, stub detection & consistency verifier
-└── rsi/                         # Module 13: Recursive Self-Improvement (RSI) orchestrator
-    └── evolution_engine.py      # Drives LLM-First -> Code-First lifecycle convergence
+├── telemetry/                   # Live host metrics & gateway observability
+│   └── health_monitor.py        # Real CPU loadavg, /proc/meminfo RAM, disk usage, uptime & installed engines
+│
+├── scripts/                     # CLI utilities (login_wechat.py, wsl_service.sh)
+└── tests/                       # Automated Pytest suite
 ```
 
 ---
 
-## ⚡ Core Design Principles
+## 🧭 Two-State Separation Contract
 
-1. **Minimal Root Directory**: The repository root keeps only entrypoints (`main.py`), core configs (`config.yaml`), environment definitions (`.env`), and orchestrator rules (`AGENTS.md`), organizing all documentation, scripts, and deployment assets into dedicated subdirectories.
-2. **Code Offload Rate $\ge 90\%$ (Design Target)**: Routine queries and frequent WeChat text/voice requests are intercepted by L0 rules and handled deterministically by local Python scripts, reducing token usage while ensuring runtime safety and zero hallucination.
-3. **Closed-Loop Physical Anti-Hallucination**: Pre/post workspace SHA-256 snapshot diffing intercepts both under-execution and undeclared modifications (automatically rolling back unauthorized file edits).
-4. **Dual-Mode Native CLI Scheduling**: Dispatches official `agy`, `pi`, `claude`, and `omp` binaries in one-liner or persistent PTY modes with automatic non-interactive `--dangerously-skip-permissions` execution protected by external sandbox guardrails.
+1. **State 1 — Non-Engine Router State (`active_engine == ""`)**:
+   - **Voice Strictly Forbidden**: Inbound WeChat voice messages (`msg_type == "voice"`) are rejected immediately with text instructions.
+   - **Text Management Commands Only**: `/help`, `/status` (live host CPU/RAM/disk/uptime + installed engines), `/engines` (install status/version, binary path & session state), `/pwd`, `/workspace <path>`, `/ls [subpath]`, `/agy`, `/pi`, `/claude`, `/omp` (instant `is_installed()` check only—zero crawlers, zero PTY probes, zero wind-control gates).
+2. **State 2 — In-Engine Native Autonomous State (`active_engine in {"agy", "pi", "claude", "omp"}`)**:
+   - **Only 3 Gateway Control Commands**: `/exit` (return to Non-Engine state), `/clear` (reset gateway-tracked `conversation_id` for a fresh thread), and `/help` (show active engine, version, bound workspace, and control hints).
+   - **100% Native Passthrough for Everything Else**: Every other text message, slash command, or verbatim WeChat native `Recognition` transcript (aborting cleanly without fallback text if empty) passes untouched to `asyncio.create_subprocess_exec(..., env=os.environ.copy())`, returning ANSI-cleaned stdout/stderr verbatim.
+
+---
+
+## 🚀 Quick Start & Tests
+
+```bash
+python3 -m venv venv
+./venv/bin/pip install -r requirements.txt
+cp .env.example .env
+./venv/bin/pytest -v tests/
+```

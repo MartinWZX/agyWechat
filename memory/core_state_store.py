@@ -1,15 +1,22 @@
-"""SQLite WAL Mode State Store with Single-Writer Pattern & FTS5."""
+"""SQLite WAL Mode Core State Store for Working Sessions and Message History."""
 import os
-import re
 import sqlite3
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Tuple, Union
+from typing import Any, Dict, Union
+
 from memory.sqlite_utils import connect as sqlite_connect
+
+_KEEP_TABLES = ("working_sessions", "messages")
+_DEPRECATED_WS_COLUMNS = ("engine_commands_json", "discovered_commands_json")
+
+
+def _quote_ident(name: str) -> str:
+    return '"' + str(name).replace('"', '""') + '"'
 
 
 class CoreStateStore:
-    """Core state store with WAL mode, FTS5 full-text search, and dual async/sync API."""
+    """Lightweight SQLite WAL state store owning strictly two tables: `working_sessions` and `messages`."""
 
     def __init__(self, db_path: Union[str, Path] = "memory/agent_core.db"):
         self.db_path = str(db_path)
@@ -22,21 +29,80 @@ class CoreStateStore:
 
     @staticmethod
     def _ensure_columns(cursor: sqlite3.Cursor, table: str, columns: Dict[str, str]) -> None:
-        """Idempotent additive schema migration (ALTER TABLE ADD COLUMN for missing columns)."""
-        cursor.execute(f"PRAGMA table_info({table});")
+        """Idempotent additive schema migration for missing columns."""
+        cursor.execute(f"PRAGMA table_info({_quote_ident(table)});")
         existing = {row[1] for row in cursor.fetchall()}
         for col_name, col_def in columns.items():
             if col_name not in existing:
-                cursor.execute(f"ALTER TABLE {table} ADD COLUMN {col_name} {col_def};")
+                cursor.execute(f"ALTER TABLE {_quote_ident(table)} ADD COLUMN {_quote_ident(col_name)} {col_def};")
 
-    def _init_db(self):
+    @staticmethod
+    def _purge_legacy_schema(conn: sqlite3.Connection, cursor: sqlite3.Cursor) -> bool:
+        """Drop all legacy zombie tables/FTS virtual tables/triggers/views and obsolete columns."""
+        cleaned = False
+
+        # Drop legacy triggers & views first so FTS/table drops never trigger dangling references.
+        for obj_type, drop_kw in (("trigger", "TRIGGER"), ("view", "VIEW")):
+            cursor.execute("SELECT name FROM sqlite_master WHERE type = ?;", (obj_type,))
+            for (name,) in cursor.fetchall():
+                if not str(name).startswith("sqlite_"):
+                    cursor.execute(f"DROP {drop_kw} IF EXISTS {_quote_ident(name)};")
+                    cleaned = True
+
+        # Drop legacy VIRTUAL TABLEs (e.g., episodic_memories_fts) before regular tables so shadow tables go cleanly.
+        cursor.execute(
+            "SELECT name, sql FROM sqlite_master WHERE type = 'table' AND name NOT IN (?, ?) AND name NOT LIKE 'sqlite_%';",
+            _KEEP_TABLES,
+        )
+        for name, sql in cursor.fetchall():
+            if sql and "VIRTUAL TABLE" in str(sql).upper():
+                cursor.execute(f"DROP TABLE IF EXISTS {_quote_ident(name)};")
+                cleaned = True
+
+        # Drop any remaining non-core tables regardless of foreign keys.
+        cursor.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT IN (?, ?) AND name NOT LIKE 'sqlite_%';",
+            _KEEP_TABLES,
+        )
+        remaining = [row[0] for row in cursor.fetchall()]
+        if remaining:
+            cursor.execute("PRAGMA foreign_keys = OFF;")
+            for name in remaining:
+                cursor.execute(f"DROP TABLE IF EXISTS {_quote_ident(name)};")
+                cleaned = True
+            cursor.execute("PRAGMA foreign_keys = ON;")
+
+        # Drop deprecated command-discovery columns from existing working_sessions tables (SQLite >= 3.35).
+        cursor.execute("PRAGMA table_info(working_sessions);")
+        ws_cols = {row[1] for row in cursor.fetchall()}
+        for col_name in _DEPRECATED_WS_COLUMNS:
+            if col_name in ws_cols:
+                cursor.execute(f"ALTER TABLE working_sessions DROP COLUMN {_quote_ident(col_name)};")
+                cleaned = True
+
+        # Check whether leftover sqlite_sequence remains after legacy AUTOINCREMENT tables were dropped.
+        cursor.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sqlite_sequence';")
+        has_seq = cursor.fetchone() is not None
+        if has_seq:
+            cleaned = True
+
+        conn.commit()
+        if cleaned:
+            conn.execute("VACUUM;")
+        return cleaned
+
+    def _init_db(self) -> None:
         with self._get_connection() as conn:
             cursor = conn.cursor()
-            # 1. Sessions & Messages
             cursor.execute("""
             CREATE TABLE IF NOT EXISTS working_sessions (
-                session_id TEXT PRIMARY KEY, user_id TEXT, created_at REAL, updated_at REAL,
-                active_engine TEXT DEFAULT '', engine_commands_json TEXT DEFAULT '[]', engine_meta_json TEXT DEFAULT '{}', workspace_dir TEXT DEFAULT ''
+                session_id TEXT PRIMARY KEY,
+                user_id TEXT,
+                created_at REAL,
+                updated_at REAL,
+                active_engine TEXT DEFAULT '',
+                engine_meta_json TEXT DEFAULT '{}',
+                workspace_dir TEXT DEFAULT ''
             );""")
             cursor.execute("""
             CREATE TABLE IF NOT EXISTS messages (
@@ -52,264 +118,23 @@ class CoreStateStore:
                 offloaded INTEGER DEFAULT 0,
                 created_at REAL
             );""")
-            # 2. Episodic Memories with FTS5
-            cursor.execute("""
-            CREATE TABLE IF NOT EXISTS episodic_memories (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                memory_key TEXT UNIQUE,
-                content TEXT,
-                tags TEXT,
-                created_at REAL,
-                updated_at REAL
-            );""")
-            cursor.execute("""
-            CREATE VIRTUAL TABLE IF NOT EXISTS episodic_memories_fts USING fts5(
-                memory_key,
-                content,
-                tags,
-                content='episodic_memories',
-                content_rowid='id'
-            );""")
-            cursor.execute("""
-            CREATE TRIGGER IF NOT EXISTS episodic_memories_ai AFTER INSERT ON episodic_memories BEGIN
-              INSERT INTO episodic_memories_fts(rowid, memory_key, content, tags) VALUES (new.id, new.memory_key, new.content, new.tags);
-            END;""")
-            cursor.execute("""
-            CREATE TRIGGER IF NOT EXISTS episodic_memories_ad AFTER DELETE ON episodic_memories BEGIN
-              INSERT INTO episodic_memories_fts(episodic_memories_fts, rowid, memory_key, content, tags) VALUES('delete', old.id, old.memory_key, old.content, old.tags);
-            END;""")
-            cursor.execute("""
-            CREATE TRIGGER IF NOT EXISTS episodic_memories_au AFTER UPDATE ON episodic_memories BEGIN
-              INSERT INTO episodic_memories_fts(episodic_memories_fts, rowid, memory_key, content, tags) VALUES('delete', old.id, old.memory_key, old.content, old.tags);
-              INSERT INTO episodic_memories_fts(rowid, memory_key, content, tags) VALUES (new.id, new.memory_key, new.content, new.tags);
-            END;""")
-            # 3. Crystallized rules & interaction patterns
-            cursor.execute("""
-            CREATE TABLE IF NOT EXISTS crystallized_rules (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                rule_name TEXT UNIQUE,
-                pattern_regex TEXT,
-                voice_homophones TEXT,
-                script_path TEXT,
-                hit_count INTEGER DEFAULT 0,
-                created_at REAL
-            );""")
-            cursor.execute("""
-            CREATE TABLE IF NOT EXISTS interaction_patterns (
-                fingerprint TEXT PRIMARY KEY,
-                raw_sample TEXT,
-                occurrence_count INTEGER DEFAULT 1,
-                last_seen REAL,
-                crystallized INTEGER DEFAULT 0,
-                timestamps_json TEXT DEFAULT '[]'
-            );""")
-            # 4. Cron Jobs, Tool & Skill Evolution History
-            cursor.execute("""
-            CREATE TABLE IF NOT EXISTS cron_jobs (
-                job_id TEXT PRIMARY KEY,
-                name TEXT,
-                cron_expr TEXT,
-                script_path TEXT,
-                target_user TEXT,
-                is_active INTEGER DEFAULT 1,
-                last_run REAL DEFAULT 0,
-                created_at REAL
-            );""")
-            cursor.execute("""
-            CREATE TABLE IF NOT EXISTS tool_evolution_history (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                tool_name TEXT,
-                action TEXT, -- create, update, merge, deprecate
-                version INTEGER,
-                diff_summary TEXT,
-                created_at REAL
-            );""")
-            cursor.execute("""
-            CREATE TABLE IF NOT EXISTS skill_evolution_history (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                skill_name TEXT,
-                version TEXT,
-                patch_summary TEXT,
-                created_at REAL
-            );""")
-            # 5. Engine Health & Wind Control Logs
-            cursor.execute("""
-            CREATE TABLE IF NOT EXISTS engine_health_states (
-                engine_id TEXT PRIMARY KEY,
-                state TEXT,
-                cooldown_until REAL DEFAULT 0,
-                last_call_timestamp REAL DEFAULT 0,
-                total_calls_today INTEGER DEFAULT 0,
-                failover_count INTEGER DEFAULT 0
-            );""")
-            cursor.execute("""
-            CREATE TABLE IF NOT EXISTS wind_control_logs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                engine_id TEXT,
-                event_type TEXT,
-                details TEXT,
-                created_at REAL
-            );""")
-            # 6. Hallucination Audits
-            cursor.execute("""
-            CREATE TABLE IF NOT EXISTS hallucination_audit_logs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                task_id TEXT,
-                engine_id TEXT,
-                hallucination_type TEXT,
-                details TEXT,
-                reverted INTEGER DEFAULT 0,
-                created_at REAL
-            );""")
 
-            # 7. Additive migrations for legacy schemas & governed RSI lifecycle
             self._ensure_columns(cursor, "messages", {
-                "msg_type": "TEXT DEFAULT 'text'", "raw_content": "TEXT DEFAULT ''",
-                "normalized_content": "TEXT DEFAULT ''", "is_voice": "INTEGER DEFAULT 0",
-                "reply_content": "TEXT DEFAULT ''", "engine_used": "TEXT DEFAULT 'UNKNOWN'",
+                "msg_type": "TEXT DEFAULT 'text'",
+                "raw_content": "TEXT DEFAULT ''",
+                "normalized_content": "TEXT DEFAULT ''",
+                "is_voice": "INTEGER DEFAULT 0",
+                "reply_content": "TEXT DEFAULT ''",
+                "engine_used": "TEXT DEFAULT 'NONE'",
                 "offloaded": "INTEGER DEFAULT 0",
             })
             self._ensure_columns(cursor, "working_sessions", {
-                "active_engine": "TEXT DEFAULT ''", "engine_commands_json": "TEXT DEFAULT '[]'",
-                "engine_meta_json": "TEXT DEFAULT '{}'", "workspace_dir": "TEXT DEFAULT ''",
+                "active_engine": "TEXT DEFAULT ''",
+                "engine_meta_json": "TEXT DEFAULT '{}'",
+                "workspace_dir": "TEXT DEFAULT ''",
             })
-            self._ensure_columns(cursor, "crystallized_rules", {
-                "status": "TEXT DEFAULT 'candidate'", "fingerprint": "TEXT DEFAULT ''",
-                "fingerprint_hash": "TEXT DEFAULT ''", "response_template": "TEXT DEFAULT ''",
-                "fail_count": "INTEGER DEFAULT 0", "source": "TEXT DEFAULT 'auto'", "updated_at": "REAL DEFAULT 0",
-            })
-            self._ensure_columns(cursor, "interaction_patterns", {
-                "raw_sample": "TEXT DEFAULT ''", "occurrence_count": "INTEGER DEFAULT 1",
-                "last_seen": "REAL DEFAULT 0", "crystallized": "INTEGER DEFAULT 0",
-                "answers_json": "TEXT DEFAULT '[]'", "timestamps_json": "TEXT DEFAULT '[]'",
-                "cron_proposed": "INTEGER DEFAULT 0",
-            })
+            self._purge_legacy_schema(conn, cursor)
 
-            for engine in ["agy", "pi", "claude", "omp"]:
-                cursor.execute("""
-                INSERT OR IGNORE INTO engine_health_states (engine_id, state, cooldown_until, last_call_timestamp, total_calls_today, failover_count)
-                VALUES (?, 'CLOSED', 0, 0, 0, 0);
-                """, (engine,))
-            conn.commit()
-
-    # ==========================================
-    # Asynchronous API
-    # ==========================================
-    async def get_or_create_session(self, session_id: str, user_id: str) -> Dict[str, Any]:
-        now = time.time()
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT * FROM working_sessions WHERE session_id = ?;", (session_id,))
-            row = cursor.fetchone()
-            if row:
-                return dict(row)
-            cursor.execute(
-                "INSERT INTO working_sessions (session_id, user_id, created_at, updated_at) VALUES (?, ?, ?, ?);",
-                (session_id, user_id, now, now)
-            )
-            conn.commit()
-            return {"session_id": session_id, "user_id": user_id, "created_at": now, "updated_at": now}
-
-    async def add_message(self, session_id: str, user_id: str, role: str, content: str) -> int:
-        now = time.time()
-        msg_id = f"msg_{int(now * 1000)}_{os.urandom(2).hex()}"
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-            INSERT INTO messages (msg_id, session_id, user_id, msg_type, raw_content, normalized_content, is_voice, reply_content, engine_used, offloaded, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, 0, '', 'UNKNOWN', 0, ?);
-            """, (msg_id, session_id, user_id, role, content, content, now))
-            conn.commit()
-            return cursor.lastrowid or 1
-
-    async def get_recent_messages(self, session_id: str, limit: int = 10) -> List[Dict[str, Any]]:
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                "SELECT msg_id, session_id, user_id, msg_type, raw_content AS content, created_at FROM messages WHERE session_id = ? ORDER BY created_at DESC LIMIT ?;",
-                (session_id, limit)
-            )
-            rows = cursor.fetchall()
-            return [dict(r) for r in reversed(rows)]
-
-    async def set_episodic_memory(self, user_id: str, category: str, key: str, value: str):
-        now = time.time()
-        memory_key = f"{user_id}:{category}:{key}"
-        with self._get_connection() as conn:
-            conn.execute("""
-            INSERT INTO episodic_memories (memory_key, content, tags, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(memory_key) DO UPDATE SET content=excluded.content, updated_at=excluded.updated_at;
-            """, (memory_key, value, f"{user_id},{category}", now, now))
-            conn.commit()
-
-    async def log_wind_control_call(self, reason: str = "call", duration_ms: float = 0.0, engine_id: str = "agy"):
-        now = time.time()
-        with self._get_connection() as conn:
-            conn.execute(
-                "INSERT INTO wind_control_logs (engine_id, event_type, details, created_at) VALUES (?, 'CALL', ?, ?);",
-                (engine_id, f"{reason} ({duration_ms}ms)", now)
-            )
-            conn.execute(
-                "UPDATE engine_health_states SET last_call_timestamp = ?, total_calls_today = total_calls_today + 1 WHERE engine_id = ?;",
-                (now, engine_id)
-            )
-            conn.commit()
-
-    async def get_sliding_window_counts(self, engine_id: str = "agy") -> Tuple[int, int, float]:
-        now = time.time()
-        five_min_ago = now - 300
-        one_hour_ago = now - 3600
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                "SELECT COUNT(*) FROM wind_control_logs WHERE engine_id = ? AND event_type = 'CALL' AND created_at > ?;",
-                (engine_id, five_min_ago)
-            )
-            c5m = cursor.fetchone()[0]
-
-            cursor.execute(
-                "SELECT COUNT(*) FROM wind_control_logs WHERE engine_id = ? AND event_type = 'CALL' AND created_at > ?;",
-                (engine_id, one_hour_ago)
-            )
-            c1h = cursor.fetchone()[0]
-
-            cursor.execute(
-                "SELECT last_call_timestamp FROM engine_health_states WHERE engine_id = ?;",
-                (engine_id,)
-            )
-            row = cursor.fetchone()
-            last_call = row["last_call_timestamp"] if row else 0.0
-            time_since = now - last_call if last_call > 0 else 9999.0
-
-            return c5m, c1h, time_since
-
-    async def get_active_rules(self) -> List[Dict[str, Any]]:
-        """Return all non-retired crystallized rules (active + staged candidates)."""
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT * FROM crystallized_rules WHERE status != 'retired' ORDER BY id DESC;")
-            return [dict(r) for r in cursor.fetchall()]
-
-    def get_recent_exchanges(self, user_id: str, limit: int = 3, since_ts: float = 0.0) -> List[Dict[str, str]]:
-        """Return the last `limit` (question, answer) pairs for a user after `since_ts`, oldest first."""
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                "SELECT normalized_content, reply_content FROM messages "
-                "WHERE user_id = ? AND reply_content != '' AND created_at >= ? ORDER BY created_at DESC LIMIT ?;",
-                (user_id, float(since_ts or 0.0), limit),
-            )
-            rows = cursor.fetchall()
-        return [{"q": r["normalized_content"] or "", "a": r["reply_content"] or ""} for r in reversed(rows)]
-
-    def close(self):
-        """No-op or cleanup for connection pool."""
-        return True
-
-    # ==========================================
-    # Synchronous API
-    # ==========================================
     def record_message(
         self,
         msg_id: str,
@@ -321,78 +146,54 @@ class CoreStateStore:
         is_voice: bool,
         reply_content: str,
         engine_used: str,
-        offloaded: bool
-    ):
+        offloaded: bool = False,
+    ) -> None:
+        """Persist an inbound/outbound WeChat message exchange."""
         with self._get_connection() as conn:
             conn.execute("""
-            INSERT OR REPLACE INTO messages (msg_id, session_id, user_id, msg_type, raw_content, normalized_content, is_voice, reply_content, engine_used, offloaded, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-            """, (
+            INSERT OR REPLACE INTO messages (
                 msg_id, session_id, user_id, msg_type, raw_content, normalized_content,
-                1 if is_voice else 0, reply_content, engine_used, 1 if offloaded else 0, time.time()
+                is_voice, reply_content, engine_used, offloaded, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+            """, (
+                msg_id,
+                session_id,
+                user_id,
+                msg_type,
+                raw_content,
+                normalized_content,
+                1 if is_voice else 0,
+                reply_content,
+                engine_used,
+                1 if offloaded else 0,
+                time.time(),
             ))
             conn.commit()
 
-    async def search_episodic_memory(self, query: str, limit: int = 5) -> List[Dict[str, Any]]:
-        tokens = [t for t in re.findall(r"[A-Za-z0-9_\u4e00-\u9fff]+", query) if len(t) >= 2]
-        fts_query = " OR ".join(f'"{tok}"' for tok in tokens[:8]) if tokens else ""
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            rows: List[Any] = []
-            if fts_query:
-                try:
-                    cursor.execute(
-                        "SELECT m.memory_key, m.content, m.tags FROM episodic_memories_fts f "
-                        "JOIN episodic_memories m ON f.rowid = m.id "
-                        "WHERE episodic_memories_fts MATCH ? LIMIT ?;",
-                        (fts_query, limit),
-                    )
-                    rows = cursor.fetchall()
-                except sqlite3.OperationalError:
-                    rows = []
-            if not rows:
-                cursor.execute(
-                    "SELECT memory_key, content, tags FROM episodic_memories "
-                    "WHERE content LIKE ? OR memory_key LIKE ? LIMIT ?;",
-                    (f"%{query}%", f"%{query}%", limit),
-                )
-                rows = cursor.fetchall()
-            results = []
-            for row in rows:
-                d = dict(row)
-                mk = d["memory_key"]
-                d["key"] = mk.split(":")[-1] if ":" in mk else mk
-                results.append(d)
-            return results
-
-    def log_hallucination(self, task_id: str, engine_id: str, h_type: str, details: str, reverted: bool = False):
-        with self._get_connection() as conn:
-            conn.execute("""
-            INSERT INTO hallucination_audit_logs (task_id, engine_id, hallucination_type, details, reverted, created_at)
-            VALUES (?, ?, ?, ?, ?, ?);
-            """, (task_id, engine_id, h_type, details, 1 if reverted else 0, time.time()))
-            conn.commit()
-
     def get_stats(self) -> Dict[str, Any]:
+        """Return real aggregated message counts and per-engine historical counts."""
         with self._get_connection() as conn:
             c = conn.cursor()
-            c.execute("SELECT COUNT(*), SUM(offloaded), SUM(is_voice) FROM messages;")
+            c.execute("SELECT COUNT(*), SUM(is_voice) FROM messages;")
             row = c.fetchone()
-            total_msgs = row[0] or 0
-            offloaded_msgs = row[1] or 0
-            voice_msgs = row[2] or 0
+            total_msgs = int(row[0] or 0)
+            voice_msgs = int(row[1] or 0)
 
-            c.execute("SELECT engine_id, state, total_calls_today, failover_count FROM engine_health_states;")
-            engines = {r["engine_id"]: dict(r) for r in c.fetchall()}
+            c.execute(
+                "SELECT LOWER(engine_used) AS eng, COUNT(*) AS cnt FROM messages "
+                "WHERE LOWER(engine_used) IN ('agy', 'pi', 'claude', 'omp') "
+                "GROUP BY LOWER(engine_used);"
+            )
+            eng_counts = {str(r["eng"]): int(r["cnt"] or 0) for r in c.fetchall()}
 
-            c.execute("SELECT hallucination_type, COUNT(*) FROM hallucination_audit_logs GROUP BY hallucination_type;")
-            h_stats = {r[0]: r[1] for r in c.fetchall()}
+        return {
+            "total_messages": total_msgs,
+            "voice_messages": voice_msgs,
+            "engine_message_counts": eng_counts,
+        }
 
-            return {
-                "total_messages": total_msgs,
-                "offloaded_messages": offloaded_msgs,
-                "voice_messages": voice_msgs,
-                "offload_rate": round(offloaded_msgs / max(1, total_msgs) * 100, 2),
-                "engines": engines,
-                "hallucinations": h_stats,
-            }
+    def close(self) -> bool:
+        """Flush SQLite WAL frames into the main database file."""
+        with self._get_connection() as conn:
+            conn.execute("PRAGMA wal_checkpoint(PASSIVE);")
+        return True

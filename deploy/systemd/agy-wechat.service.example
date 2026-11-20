@@ -4,7 +4,7 @@ After=network.target
 
 [Service]
 Type=simple
-User=martin
+User=your_service_user
 WorkingDirectory=/opt/agyWechat
 ExecStart=/opt/agyWechat/venv/bin/python3 main.py
 Restart=always

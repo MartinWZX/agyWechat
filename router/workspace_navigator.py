@@ -7,7 +7,7 @@ from typing import Iterable, List, Optional, Tuple
 from memory.engine_session_repository import EngineSessionRepository
 
 PROJECT_MARKERS = (".git", "pyproject.toml", "package.json", "Cargo.toml", "go.mod", "AGENTS.md")
-FORBIDDEN_DIR_NAMES = {".ssh", ".aws", ".gnupg", ".kube", ".docker"}
+FORBIDDEN_DIR_NAMES = {".ssh", ".aws", ".gnupg", ".kube", ".docker", "gcloud"}
 FORBIDDEN_PREFIXES = ("/etc", "/usr", "/bin", "/sbin", "/var", "/boot", "/dev", "/proc", "/sys", "/root")
 SKIP_LS_NAMES = {"__pycache__", ".pytest_cache", "node_modules", ".git"}
 
@@ -135,5 +135,5 @@ class WorkspaceNavigator:
         badge = f"（检测到: {', '.join(markers)}）" if markers else ""
         return (
             f"✅ 已将当前会话工作目录切换至：\n`{saved}` {badge}\n"
-            "👉 现在可发送 `/agy`（或 `/pi`、`/claude`、`/omp`）在该目录下启动引擎并探测命令。"
+            "👉 现在可发送 `/agy`（或 `/pi`、`/claude`、`/omp`）在该目录下启动引擎原生会话。"
         )

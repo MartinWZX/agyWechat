@@ -1,9 +1,11 @@
 """Tencent iLink Bot Pusher, ContextTokenStore & Long-Polling Gateway Worker."""
 import asyncio
 from collections import OrderedDict
+import inspect
 import json
 import logging
 from pathlib import Path
+import threading
 import time
 from typing import Any, Dict, Optional
 
@@ -42,40 +44,50 @@ __all__ = [
 
 
 class ContextTokenStore:
-    """Disk-backed storage for user context tokens required by iLink Bot replies."""
+    """Disk-backed thread-safe storage for user context tokens required by iLink Bot replies."""
 
     def __init__(self, storage_path: Path):
         self.storage_path = storage_path
         self._tokens: Dict[str, str] = {}
-        self._lock = asyncio.Lock()
+        self._lock = threading.RLock()
         self.load()
 
     def load(self) -> None:
-        if self.storage_path.exists():
-            try:
-                data = json.loads(self.storage_path.read_text(encoding="utf-8"))
-                if isinstance(data, dict):
-                    self._tokens = {str(k): str(v) for k, v in data.items()}
-            except (OSError, ValueError) as e:
-                logger.warning("Failed to load context tokens from %s: %s", self.storage_path, e)
+        with self._lock:
+            if self.storage_path.exists():
+                try:
+                    data = json.loads(self.storage_path.read_text(encoding="utf-8"))
+                    if isinstance(data, dict):
+                        self._tokens = {str(k): str(v) for k, v in data.items()}
+                except (OSError, ValueError) as e:
+                    logger.warning("Failed to load context tokens from %s: %s", self.storage_path, e)
 
     def save(self) -> None:
-        try:
-            self.storage_path.write_text(json.dumps(self._tokens, ensure_ascii=False, indent=2), encoding="utf-8")
-        except OSError as e:
-            logger.warning("Failed to persist context tokens to %s: %s", self.storage_path, e)
+        with self._lock:
+            try:
+                self.storage_path.write_text(json.dumps(self._tokens, ensure_ascii=False, indent=2), encoding="utf-8")
+            except OSError as e:
+                logger.warning("Failed to persist context tokens to %s: %s", self.storage_path, e)
 
     def get(self, user_id: str) -> Optional[str]:
-        return self._tokens.get(user_id)
+        with self._lock:
+            return self._tokens.get(user_id)
 
     def set(self, user_id: str, context_token: str) -> None:
-        self._tokens[user_id] = context_token
-        self.save()
+        with self._lock:
+            self._tokens[user_id] = context_token
+            self.save()
 
     def remove(self, user_id: str) -> None:
-        if user_id in self._tokens:
-            self._tokens.pop(user_id, None)
-            self.save()
+        with self._lock:
+            if user_id in self._tokens:
+                self._tokens.pop(user_id, None)
+                self.save()
+
+    def latest_user_id(self) -> Optional[str]:
+        """Return the most recently stored user ID, if any."""
+        with self._lock:
+            return next(reversed(self._tokens), None)
 
 
 class ILinkPusher:
@@ -87,7 +99,7 @@ class ILinkPusher:
         self.client = client
         self.splitter = WeChatSplitter(max_length=settings.WECHAT_MAX_MSG_LEN)
 
-    async def send_raw(self, user_id: str, content: str, msg_type: str = "text") -> bool:
+    async def send_raw(self, user_id: str, content: str) -> bool:
         """Send content chunks to the WeChat user via iLink Bot sendmessage."""
         raw_token = self.settings.WEIXIN_TOKEN
         token = raw_token.get_secret_value() if hasattr(raw_token, "get_secret_value") else raw_token
@@ -150,7 +162,6 @@ class ILinkGatewayWorker:
         self._task: Optional[asyncio.Task] = None
         self._sync_buf = self._load_sync_buf()
         self._seen_msg_ids: "OrderedDict[str, float]" = OrderedDict()
-        self.active_user: Optional[str] = None
 
     def _load_sync_buf(self) -> str:
         try:
@@ -184,15 +195,6 @@ class ILinkGatewayWorker:
         if "*" in self.settings.ALLOWED_USERS:
             return True
         return user_id in self.settings.ALLOWED_USERS
-
-    async def on_terminal_output(self, text: str) -> None:
-        target_user = getattr(self.router, "active_user", None) if self.router else None
-        if not target_user:
-            target_user = self.active_user
-        if target_user:
-            for chunk in self.pusher.splitter.split(text):
-                if chunk.strip():
-                    await self.pusher.send_raw(target_user, chunk)
 
     def start(self) -> None:
         if self._running:
@@ -232,7 +234,15 @@ class ILinkGatewayWorker:
                         client=client,
                     )
                     consecutive_errors = 0
-                    if data.get("ret", 0) != 0:
+                    ret = data.get("ret", 0)
+                    errcode = data.get("errcode", 0)
+                    if ret != 0 or errcode != 0:
+                        logger.warning(
+                            "iLink getupdates returned non-zero status: ret=%s errcode=%s errmsg=%s",
+                            ret,
+                            errcode,
+                            data.get("errmsg", ""),
+                        )
                         await asyncio.sleep(2)
                         continue
                     self._save_sync_buf(str(data.get("get_updates_buf") or self._sync_buf))
@@ -242,6 +252,7 @@ class ILinkGatewayWorker:
                     break
                 except Exception as e:
                     consecutive_errors += 1
+                    logger.warning("iLink getupdates error (streak=%d): %s", consecutive_errors, e)
                     await asyncio.sleep(min(consecutive_errors * 2, 30))
         finally:
             await client.aclose()
@@ -251,38 +262,55 @@ class ILinkGatewayWorker:
         context_token = str(msg.get("context_token") or "").strip()
         if not from_user:
             return
-        dedup_id = str(msg.get("msg_id") or msg.get("client_id") or "").strip()
+        dedup_id = str(msg.get("msg_id") or msg.get("message_id") or msg.get("client_id") or "").strip()
         if self._is_duplicate_msg(dedup_id):
             return
         if context_token:
-            self.token_store.set(from_user, context_token)
+            await asyncio.to_thread(self.token_store.set, from_user, context_token)
 
-        text_content = ""
+        text_parts = []
+        has_voice = False
+        has_text = False
         for item in msg.get("item_list") or []:
             if item.get("type") == 1 and "text_item" in item:
-                text_content += item["text_item"].get("text", "")
+                txt = str(item["text_item"].get("text", ""))
+                if txt:
+                    has_text = True
+                    text_parts.append(txt)
             elif "voice_item" in item and isinstance(item["voice_item"], dict):
-                text_content += str(item["voice_item"].get("text") or item["voice_item"].get("recognition") or "")
-        text_content = text_content.strip()
-        if not text_content:
+                has_voice = True
+                vtxt = str(item["voice_item"].get("text") or item["voice_item"].get("recognition") or "")
+                if vtxt:
+                    text_parts.append(vtxt)
+            elif item.get("type") == 3:
+                has_voice = True
+        text_content = "".join(text_parts).strip()
+        if not text_content and not has_voice:
             return
 
         if not self.is_authorized(from_user):
             await self.pusher.send_raw(from_user, "⛔ 权限受限：您不在当前 WeChat-AGY Bridge 的白名单内。")
             return
 
-        self.active_user = from_user
+        inferred_type = "voice" if (has_voice and not has_text) else "text"
         try:
             if hasattr(self.router, "route"):
-                reply = await self.router.route(from_user, text_content)
+                route_fn = self.router.route
+                if inferred_type == "voice" and "msg_type" in inspect.signature(route_fn).parameters:
+                    result = await route_fn(from_user, text_content, msg_type="voice")
+                else:
+                    result = await route_fn(from_user, text_content)
+                reply = result.reply if hasattr(result, "reply") else str(result or "")
             elif hasattr(self.router, "process_inbound_message"):
-                reply = await self.router.process_inbound_message(from_user, text_content)
+                proc_fn = self.router.process_inbound_message
+                if inferred_type == "voice" and "msg_type" in inspect.signature(proc_fn).parameters:
+                    reply = await proc_fn(from_user, text_content, msg_type="voice")
+                else:
+                    reply = await proc_fn(from_user, text_content)
             else:
                 reply = "Router does not implement route or process_inbound_message."
             if reply:
-                for chunk in self.pusher.splitter.split(reply):
-                    if chunk.strip():
-                        await self.pusher.send_raw(from_user, chunk)
+                await self.pusher.send_raw(from_user, reply)
         except Exception as e:
             logger.error("Error routing WeChat message: %s", e)
             await self.pusher.send_raw(from_user, f"❌ 处理指令出错：{e}")

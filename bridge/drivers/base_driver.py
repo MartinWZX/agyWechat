@@ -1,34 +1,85 @@
-"""Abstract Base CLI Agent Driver with Environment Scrubbing & Sandbox Command Audit."""
+"""Abstract Base CLI Agent Driver with Full Host Environment Passthrough."""
 import abc
 import asyncio
-import fcntl
+import contextlib
+import inspect
 import json
 import os
-import shlex
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from pathlib import Path
+import shutil
+import signal
+from typing import Any, Dict, List, Optional, Tuple
 
-from bridge.engine_command_discovery import (
-    EngineDiscoveryResult,
-    discover_engine_commands,
-    resolve_binary,
-    run_cli_capture,
-)
-from sandbox.approval_guard import ApprovalGuard, SandboxSecurityError, scrub_environment
+
+def resolve_binary(binary_path: str) -> Optional[str]:
+    """Resolve explicit path or search PATH and common user-local binary directories."""
+    if not binary_path:
+        return None
+    if os.sep in binary_path or "/" in binary_path:
+        p = Path(binary_path)
+        return str(p) if p.is_file() else None
+    extra_dirs = [
+        os.path.expanduser("~/.local/bin"),
+        os.path.expanduser("~/.bun/bin"),
+        "/usr/local/bin",
+    ]
+    current_path = os.environ.get("PATH", "")
+    search_path = os.pathsep.join([current_path, *[d for d in extra_dirs if d not in current_path]])
+    return shutil.which(binary_path, path=search_path)
+
+
+async def run_cli_capture(
+    argv: List[str],
+    workspace_dir: str,
+    timeout: float = 2.0,
+) -> Tuple[int, str, str]:
+    """Run a lightweight read-only binary check (such as `--version`) with full host env."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=workspace_dir,
+            env=os.environ.copy(),
+            start_new_session=True,
+        )
+    except FileNotFoundError:
+        return 127, "", f"Executable '{argv[0]}' not found."
+    except OSError as exc:
+        return -1, "", f"Failed to start subprocess: {exc}"
+
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        return (
+            proc.returncode if proc.returncode is not None else -1,
+            stdout.decode("utf-8", errors="ignore"),
+            stderr.decode("utf-8", errors="ignore"),
+        )
+    except asyncio.TimeoutError:
+        with contextlib.suppress(ProcessLookupError, OSError):
+            os.killpg(proc.pid, signal.SIGKILL)
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+        with contextlib.suppress(Exception):
+            await proc.wait()
+        return -1, "", f"Timed out after {timeout}s"
 
 
 class BaseCLIAgentDriver(abc.ABC):
-    """Unified base driver enforcing scrubbed credentials, command safety, and config injection."""
+    """Unified base driver passing 100% host environment and native CLI flags directly."""
+
+    supports_json_output: bool = False
+    conversation_flag: str = ""
 
     def __init__(
         self,
         engine_id: str,
         binary_path: str,
         skip_flag: str,
-        default_model: str = "fast",
-        timeout: int = 60,
-        max_turns: int = 3,
-        lock_file: Optional[str] = None,
-        env_passthrough: Optional[Iterable[str]] = None,
+        default_model: str = "inherit",
+        timeout: int = 0,
+        max_turns: int = 0,
     ):
         self.engine_id = engine_id
         self.binary_path = binary_path
@@ -36,8 +87,11 @@ class BaseCLIAgentDriver(abc.ABC):
         self.default_model = default_model
         self.timeout = int(timeout)
         self.max_turns = int(max_turns)
-        self.lock_file = lock_file or f"/tmp/agent_core/locks/{engine_id}.lock"
-        self.env_passthrough: List[str] = list(env_passthrough or ())
+
+    @property
+    def supports_native_session(self) -> bool:
+        """Return True when this CLI driver supports structured JSON + conversation resumption."""
+        return bool(self.supports_json_output and self.conversation_flag)
 
     @classmethod
     def from_engine_config(cls, engine_cfg: Optional[Dict[str, Any]] = None) -> "BaseCLIAgentDriver":
@@ -49,40 +103,42 @@ class BaseCLIAgentDriver(abc.ABC):
             kwargs["skip_flag"] = str(cfg["dangerously_skip_permissions_flag"])
         if cfg.get("default_model"):
             kwargs["default_model"] = str(cfg["default_model"])
-        if cfg.get("timeout_seconds"):
+        if "timeout_seconds" in cfg and cfg["timeout_seconds"] is not None:
             kwargs["timeout"] = int(cfg["timeout_seconds"])
-        if cfg.get("max_turns"):
+        if "max_turns" in cfg and cfg["max_turns"] is not None:
             kwargs["max_turns"] = int(cfg["max_turns"])
-        if cfg.get("pty_lock_file"):
-            kwargs["lock_file"] = str(cfg["pty_lock_file"])
-        if cfg.get("env_passthrough"):
-            kwargs["env_passthrough"] = list(cfg["env_passthrough"])
+
+        sig_params = inspect.signature(cls.__init__).parameters
+        accepts_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig_params.values())
+        if not accepts_var_kw:
+            kwargs = {k: v for k, v in kwargs.items() if k in sig_params}
         return cls(**kwargs)
 
     @abc.abstractmethod
     def build_one_liner_cmd(self, prompt: str) -> List[str]:
         raise NotImplementedError("Subclasses must implement build_one_liner_cmd")
 
-    def _audit_invocation_prefix(self, cmd: List[str], prompt: str) -> None:
-        """Scan driver binary & flag arguments (excluding literal prompt payload) against blacklist."""
-        non_prompt_tokens = [tok for tok in cmd if tok != prompt]
-        ApprovalGuard.scan_shell_command(" ".join(shlex.quote(t) for t in non_prompt_tokens))
+    def _apply_default_model(self, cmd: List[str], extra_flags: Optional[List[str]] = None) -> List[str]:
+        """Inject configured `--model` when default_model != 'inherit' and not overridden in extra_flags."""
+        model = str(self.default_model or "").strip()
+        if not model or model.lower() == "inherit":
+            return cmd
+        if "--model" in cmd or (extra_flags and any(str(f).strip() == "--model" for f in extra_flags)):
+            return cmd
+        insert_pos = 2 if len(cmd) > 1 and cmd[1] == "run" else 1
+        return [*cmd[:insert_pos], "--model", model, *cmd[insert_pos:]]
 
-    async def _run_cmd(self, cmd: List[str], prompt: str, workspace_dir: str) -> Tuple[int, str, str]:
-        """Execute a single scrubbed non-interactive CLI invocation after blacklist audit."""
-        try:
-            self._audit_invocation_prefix(cmd, prompt)
-        except SandboxSecurityError as sec_err:
-            return 126, "", f"Sandbox command guard blocked invocation: {sec_err}"
-
-        safe_env = scrub_environment(self.env_passthrough)
+    async def _run_cmd(self, cmd: List[str], workspace_dir: str) -> Tuple[int, str, str]:
+        """Execute a native CLI invocation directly with the complete host environment."""
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
+                stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=workspace_dir,
-                env=safe_env,
+                env=os.environ.copy(),
+                start_new_session=True,
             )
         except FileNotFoundError:
             return 127, "", f"Binary '{self.binary_path}' not installed on system."
@@ -90,80 +146,66 @@ class BaseCLIAgentDriver(abc.ABC):
             return -1, "", f"Subprocess start failed: {e}"
 
         try:
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=self.timeout)
+            if self.timeout is None or self.timeout <= 0:
+                stdout, stderr = await proc.communicate()
+            else:
+                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=self.timeout)
             return (
                 proc.returncode if proc.returncode is not None else -1,
                 stdout.decode("utf-8", errors="ignore"),
                 stderr.decode("utf-8", errors="ignore"),
             )
         except asyncio.TimeoutError:
-            proc.kill()
-            await proc.wait()
+            with contextlib.suppress(ProcessLookupError, OSError):
+                os.killpg(proc.pid, signal.SIGKILL)
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
+            with contextlib.suppress(Exception):
+                await proc.wait()
             return -1, "", f"Execution timed out after {self.timeout}s"
+        except asyncio.CancelledError:
+            with contextlib.suppress(ProcessLookupError, OSError):
+                os.killpg(proc.pid, signal.SIGKILL)
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
+            with contextlib.suppress(Exception):
+                await proc.wait()
+            raise
 
     async def execute_one_liner(self, prompt: str, workspace_dir: str) -> Tuple[int, str, str]:
         """Execute standard non-interactive CLI prompt."""
-        return await self._run_cmd(self.build_one_liner_cmd(prompt), prompt, workspace_dir)
+        cmd = self._apply_default_model(self.build_one_liner_cmd(prompt))
+        return await self._run_cmd(cmd, workspace_dir)
 
     async def execute_with_flags(
         self, prompt: str, workspace_dir: str, extra_flags: Optional[List[str]] = None
     ) -> Tuple[int, str, str]:
-        """Execute non-interactive prompt with session-configured CLI overrides and resume flags."""
-        cmd = self.build_one_liner_cmd(prompt)
-        allowed_flags = {
-            "--model", "--mode", "--effort", "--agent", "--add-dir",
-            "--output-format", "--conversation", "--resume",
-        }
+        """Execute non-interactive prompt with optional native session/output flags."""
+        cmd = self._apply_default_model(self.build_one_liner_cmd(prompt), extra_flags=extra_flags)
         if extra_flags and cmd:
-            validated: List[str] = []
-            idx = 0
-            while idx + 1 < len(extra_flags):
-                flag_name = str(extra_flags[idx]).strip()
-                flag_val = str(extra_flags[idx + 1]).strip()
-                if flag_name in allowed_flags and flag_val:
-                    validated.extend([flag_name, flag_val])
-                idx += 2
-            if validated:
-                cmd = [cmd[0], *validated, *cmd[1:]]
-        return await self._run_cmd(cmd, prompt, workspace_dir)
+            clean_flags = [str(tok) for tok in extra_flags if str(tok)]
+            if clean_flags:
+                insert_pos = 2 if len(cmd) > 1 and cmd[1] == "run" else 1
+                cmd = [*cmd[:insert_pos], *clean_flags, *cmd[insert_pos:]]
+        return await self._run_cmd(cmd, workspace_dir)
 
-    async def execute_pty(self, prompt: str, workspace_dir: str) -> Tuple[int, str, str]:
-        """Single-host serialized execution protected by non-blocking OS flock."""
-        os.makedirs(os.path.dirname(self.lock_file), exist_ok=True)
-        lock_f = open(self.lock_file, "w")
-        try:
-            await asyncio.to_thread(fcntl.flock, lock_f.fileno(), fcntl.LOCK_EX)
-            try:
-                return await self.execute_one_liner(prompt, workspace_dir)
-            finally:
-                fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
-        finally:
-            lock_f.close()
+    def is_installed(self) -> bool:
+        """Return True iff this engine's configured binary resolves on the host system."""
+        return resolve_binary(self.binary_path) is not None
 
-    async def discover_commands(self, workspace_dir: str, timeout: float = 20.0) -> EngineDiscoveryResult:
-        """Query available commands & metadata dynamically from the installed CLI binary."""
-        return await discover_engine_commands(
-            engine_id=self.engine_id,
-            binary_path=self.binary_path,
-            workspace_dir=workspace_dir,
-            env_passthrough=self.env_passthrough,
-            timeout=timeout,
-        )
-
-    async def execute_subcommand(
-        self, args: List[str], workspace_dir: str, timeout: float = 20.0
-    ) -> Tuple[int, str, str]:
-        """Run a verified CLI subcommand (e.g., models/agents/changelog) without LLM wrapping."""
+    async def probe_version(self, workspace_dir: str = ".", timeout: float = 2.0) -> str:
+        """Query `--version` from the installed CLI binary, returning empty string when missing/failing."""
         resolved = resolve_binary(self.binary_path)
         if not resolved:
-            return 127, "", f"Binary '{self.binary_path}' not installed on system."
-        return await run_cli_capture(
-            [resolved, *args], workspace_dir, timeout=timeout, env_passthrough=self.env_passthrough
-        )
+            return ""
+        rc, out, _ = await run_cli_capture([resolved, "--version"], workspace_dir, timeout=timeout)
+        if rc == 0 and out.strip():
+            return out.strip().splitlines()[0][:80]
+        return ""
 
 
 def _format_cli_command_payload(cmd_obj: Dict[str, Any]) -> str:
-    """Format structured JSON `command` panel payloads (e.g. /hooks, /permissions, /agents)."""
+    """Format structured JSON `command` panel payloads when emitted by a CLI engine."""
     cname = str(cmd_obj.get("name") or "command").strip()
     data = cmd_obj.get("data")
     if isinstance(data, dict):
@@ -196,30 +238,6 @@ def extract_engine_json_result(raw_stdout: str) -> Tuple[str, Optional[str]]:
     body = str(payload.get("response") or payload.get("result") or "")
     if not body and isinstance(payload.get("command"), dict):
         body = _format_cli_command_payload(payload["command"])
-    if not body and payload.get("status") in ("SUCCESS", "success"):
-        usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else {}
-        turns = payload.get("num_turns")
-        tokens = usage.get("total_tokens")
-        meta_parts = [p for p in (f"turns={turns}" if turns is not None else "", f"tokens={tokens}" if tokens else "") if p]
-        suffix = f"（{', '.join(meta_parts)}）" if meta_parts else ""
-        body = f"✅ CLI 指令已执行完成{suffix}。"
-    elif not body and payload.get("status") not in (None, "SUCCESS", "success"):
-        body = str(payload.get("error") or raw_stdout)
-    if "response" in payload or "result" in payload or isinstance(payload.get("command"), dict):
-        return body, conv_id
-    return raw_stdout, conv_id
-
-
-def format_workspace_diff_note(diff: Dict[str, Any]) -> str:
-    """Summarize physical file changes made during a coding turn without modifying workspace files."""
-    parts: List[str] = []
-    for label, key in (("新建", "created"), ("修改", "modified"), ("删除", "deleted")):
-        items = sorted(diff.get(key) or ())
-        if items:
-            preview = ", ".join(items[:6])
-            if len(items) > 6:
-                preview += f" 等共{len(items)}个"
-            parts.append(f"{label}: {preview}")
-    if not parts:
-        return ""
-    return "\n\n📁 本轮真实文件变更：" + " | ".join(parts)
+    elif not body and payload.get("error"):
+        body = str(payload["error"])
+    return (body if body else raw_stdout), conv_id

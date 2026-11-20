@@ -1,159 +1,66 @@
-# WeChat Multi-CLI Agent RSI Architecture 项目介绍与使用指南
+# agyWechat 项目介绍与使用指南
 
-> **项目名称**：WeChat Multi-CLI Agent RSI Architecture (`agyWechat`)  
-> **项目定位**：基于“代码优先、大模型最后（Code-First, LLM-Last）”与 RSI 递归自我演进哲学的生产级全自主多智能体编排与微信服务系统  
-> **核心驱动**：Google Antigravity CLI (`agy`)、Pi Agent (`pi`)、Claude Code (`claude`)、Oh-My-Pi (`omp`)
-
----
-
-## 一、 项目背景与范式变革
-
-在现阶段以大语言模型（LLM）为驱动的自动化工具中，行业普遍面临三大核心瓶颈：
-1. **概率脆弱性（Probabilistic Fragility）**：模型输出具有随机性，同一问题多次询问可能得到不同格式或逻辑的答案，难以作为稳定运行的底层基础设施；
-2. **算力与风控壁垒（Latency & Rate Limiting）**：每次微小交互都要消耗数千 Token 并等待数秒甚至数十秒网络往返，高频调用更极易触发厂商 `HTTP 429 Too Many Requests` 或 `HTTP 403 Forbidden` 封号；
-3. **“口嗨幻觉”与执行断层（Hallucination Gap）**：模型常常在回答中宣称“已经修复”、“已创建文件”，但物理文件系统并未发生任何实际改变，或在未声明的情况下擅自修改系统关键文件。
-
-### 核心演进范式：从“大模型优先”向“代码优先”收敛 (The RSI Paradigm Shift)
-
-**WeChat Multi-CLI Agent** 颠覆了传统“每次提问均调用大模型”的昂贵路径，确立了**自我淘汰（Self-Obsoletion via Code Solidification）**的设计准则：
-
-- **冷启动与探索期（Genesis - LLM-First, Code-Last）**：
-  - 系统成熟度得分 $< 0.4$。当系统面对一个全新任务或未知领域时，系统内缺乏现成规则与代码。此时**大模型作为第一要素**，负责分析需求、编写新工具（Tools）、提炼初始技能（Skills），并由胶水代码串联跑通。
-- **追问与共创期（Evolution - Interactive RSI Co-Evolution）**：
-  - 系统成熟度得分 $0.4 \le \text{score} < 0.8$。在用户通过微信与智能体不断交互、追问、指出漏洞并要求修改的过程中，系统开启动态递归迭代：
-    - **工具列表动态优化**：自动对 `tools/tool_registry.py` 中的工具进行参数修正、函数重构或合并，经沙盒 AST 检验与测试运行后热更新，并持久化历史版本快照；
-    - **经验沉淀为技能**：排障流程与工具组合经验自动沉淀为 `.agents/skills/` 下的标准化 Markdown 与 `skills/scripts/` 脚本，避免重复探索；
-    - **频次与规律追踪**：系统实时追踪意图触发频次 $N$ 与时间间隔方差。
-- **成熟收敛期（Convergence - Code-First, LLM-Last）**：
-  - 系统成熟度得分 $\ge 0.8$。
-  - 高频问题（频次 $N \ge 3$）自动固化为 L0 秒级正则表达式规则或 Python 脚本，直接拦截回复，消耗 **0 Token、0 秒等待**；
-  - 周期性任务（变异系数 $CV \le 0.25$）自动推导 Cron 表达式写入纯代码调度器 `scheduler/jobs.json`，由本地 Python 进程定期执行；
-  - **最终状态**：系统中 95% 以上的日常运维与常规问答完全由 100% 确定性的 Python 代码接管，概率性大模型的调用率收敛趋近于 0（$\lim_{t \to \infty} P(\text{LLM}) \to 0$）。只有当出现脱离已有代码库的全新异常时，系统才唤醒大模型介入。
+> **项目名称**：`agyWechat` — 纯粹“两态分离”微信路由与四大原生 AI 引擎 100% 直通网关  
+> **支持渠道**：个人微信腾讯 iLink Bot 扫码直连 / 企业微信与公众号 Webhook  
+> **支持引擎**：Google Antigravity (`agy`) · Pi (`pi`) · Claude Code (`claude`) · Oh-My-Pi (`omp`)
 
 ---
 
-## 二、 核心特性矩阵
+## 一、 项目定位
 
-### 1. 原生四大主流命令行智能体接入 (Multi-CLI Drivers)
-- **100% 官方原生二进制调用**：直接调用宿主机上由官方发布的原版 `agy`、`pi`、`claude`、`omp`，保留原生安全握手（如 `loadCodeAssist`）、TLS 特征与官方遥测。
-- **单机一行式与常驻会话双模引擎**：
-  - 支持单行子进程模式（One-Liner）：`claude -p` / `pi -p` / `omp run` / `agy -p`，进程随用随关；
-  - 支持常驻 PTY 终端会话模式：利用系统文件锁单例维持 `agy` 会话，消除频繁重连的 403 风险。
-- **跨引擎无感故障转移（Multi-Engine Failover）**：当主通道（如 `agy`）因配额或网络进入冷却期时，调度器在毫秒级自动切换至 `pi`、`claude` 或 `omp` 备选引擎。
+**agyWechat** 是一套运行在本地 Linux / WSL 宿主机上的极简微信网关，严格恪守**“两态分离（Two-State Separation）”**：
 
-### 2. 全引擎默认 `dangerously-skip-permissions` 全自主免确认执行
-- 后台服务与微信异步通讯环境中，任何终端 `[y/N]` 确认提示都会引发线程死锁。系统全引擎强制注入跳过权限确认参数：
-  - `agy`：默认注入 `--dangerously-skip-permissions`；
-  - `claude`：默认注入 `claude -p "<prompt>" --dangerously-skip-permissions --max-turns 3`；
-  - `pi`：默认注入 `pi -p "<prompt>" --no-confirm`；
-  - `omp`：默认注入 `omp run --dangerously-skip-permissions --yes -p "<prompt>"`。
-- **外置沙盒硬防护补偿 (`sandbox/approval_guard.py`)**：在 Python 外层强力拦截越界目录（禁止访问根目录、`~/.ssh`、`~/.aws`、`/etc/passwd`）与高危命令（`rm -rf /`、`mkfs`、`shutdown`、`dd`），确保宿主机绝对安全。
-
-### 3. 五维一体高安全反风控体系 (Zero 429/403 Policy)
-1. **滑动窗口限频**：最小调用间隔 $\ge 12.0$ 秒，5 分钟滑动窗口 $\le 6$ 次，1 小时 $\le 30$ 次，24 小时 $\le 200$ 次；
-2. **人类节奏伪装延迟**：请求间隔自动注入 $1.5 \sim 4.8$ 秒随机抖动；
-3. **静默时段控制**：每日 `01:00 ~ 07:00` 暂停日常认知调用，仅响应 P0 紧急请求；
-4. **429 智能阶梯退避**：遭遇 429 时阶梯冷却 `[120s, 600s, 1800s]`（2 分钟、10 分钟、30 分钟）；
-5. **403 账号硬隔离熔断**：遭遇 403 立即锁定外发 24 小时（86,400 秒），防止封号扩散；
-6. **内层子智能体受控并发**：并发数 $\le 2$，限制 `flash` / `haiku` 模型，单次轮数 $\le 3$ 步。
-
-### 4. 四维反幻觉确定性物理闭环
-- **物理工作区快照比对（WorkspaceSnapshotDiffer）**：基于 SHA-256 真实对比执行前后物理文件哈希，彻底杜绝“说多做少”与“说少做多”。
-- **沙盒影子空跑（Shadow Dry-Run）**：所有新变异的工具与技能脚本在部署前必须通过 AST 语法树解析与沙盒试运行，确认 Exit Code 0 后方可上线。
-- **强制四段式履约协议**：严格按 `<facts_anchor>`、`<causal_chain>`、`<execution_manifest>`、`<final_conclusion>` 结构化输出。
-
-### 5. 微信生态原生适配与多端直连
-- **双通道接入**：
-  - **个人号免公网扫码直连**：基于腾讯官方 iLink Bot 协议出站长轮询，无需公网 IP 与域名备案；
-  - **企业号 / Webhook 回调接入**：支持标准企业微信机器人、ClawBot 及微信公众平台。
-- **微信原生语音直提与同音字纠错**：
-  - 原生提取微信转写的 `Recognition` 文本；
-  - 内置基于拼音相似度与编辑距离的术语归一化（如“阿吉” $\to$ `agy`，“克劳德” $\to$ `claude`，“丰控看板” $\to$ `#风控看板`）。
-- **终端 TUI / ANSI 序列净化**：将富文本控制字符、光标位移、动态 Spinner 实时重构为美观规范的 Markdown。
+1. **第一态【非引擎态 / 网关路由态】**：
+   - **严禁语音控制**：仅接收纯文本管理命令，语音消息一律拦截并提示进入引擎后再使用语音。
+   - **宿主电脑与工作区观测**：通过 `/status` 实时获取宿主机 CPU 1/5/15 分钟负载、物理内存总量/可用量/使用率、磁盘剩余空间、网关运行时长与已安装引擎列表；通过 `/engines` 实时探测四大引擎本机安装状态、版本、可执行路径与当前会话状态；通过 `/pwd`、`/workspace`、`/ls` 在安全目录边界内浏览与切换工作项目。
+   - **毫秒级路由入口**：`/agy`、`/pi`、`/claude`、`/omp` 仅校验本机二进制是否存在，存在即刻进入引擎态并返回简洁欢迎面板。
+2. **第二态【引擎态 / 100% 原生 AI 智能体自治态】**：
+   - **微信原生语音直通**：允许使用微信语音消息，直接读取微信原生转写的 `Recognition` 文本并原样透传给当前引擎（若为空则直接报错，绝不伪造兜底）。
+   - **网关仅管 3 个控制命令**：仅 `/exit`（退出引擎）、`/clear`（重置原生 `conversation_id`）、`/help`（极简帮助）由网关处理；**其余一切自然语言、语音及斜杠命令全部携带完整宿主机环境原封不动直通原生 CLI**。
 
 ---
 
-## 三、 快速上手与操作指南
+## 二、 核心操作指令速查
 
-### 1. 环境准备与依赖安装
+### 1. 非引擎态（未进入引擎时，仅限文本命令）
 
-系统要求 Linux 操作系统（推荐 Ubuntu 22.04+ 或 Debian 12+），Python 3.10+。
+| 命令 | 说明 |
+| :--- | :--- |
+| `/help` | 查看网关路由可用命令、工作目录操作说明与引擎入口 |
+| `/status` | 查看宿主机 CPU 负载、内存总量/可用/使用率、磁盘剩余空间、运行时长与已安装引擎 |
+| `/engines` | 查看 `agy` / `pi` / `claude` / `omp` 的安装状态与版本、二进制路径与当前会话状态 |
+| `/pwd` | 查看当前工作目录路径 |
+| `/workspace <路径>` | 校验并切换当前会话的工作区根目录 |
+| `/ls [子目录]` | 列出当前工作区或指定子目录下的文件与文件夹 |
+| `/agy` \| `/pi` \| `/claude` \| `/omp` | 校验二进制已安装后毫秒级进入对应引擎原生会话 |
+
+### 2. 引擎态（进入 `/agy`、`/pi`、`/claude` 或 `/omp` 之后）
+
+- **网关控制命令（仅 3 个）**：
+  - `/exit`：退出当前引擎会话，回到网关路由态
+  - `/clear`：清空网关记录的原生会话线程 (`conversation_id`)，下轮开启全新对话
+  - `/help`：显示当前引擎名称、版本、工作区路径、会话状态与退出/重置提示
+- **100% 原生透传**：除以上 3 个命令外，所有自然语言文本、微信原生语音（`Recognition`）以及任何其他 `/斜杠命令` 均原封不动直接交由底层原生 CLI 在完整宿主机环境中执行，输出与报错经 ANSI 清洗后原样回传。
+
+---
+
+## 三、 部署、测试与服务启动
 
 ```bash
-# 1. 克隆代码仓库
-git clone https://github.com/MartinWZX/agyWechat.git
-cd agyWechat
-
-# 2. 创建并激活虚拟环境
+# 1. 创建虚拟环境并安装依赖
 python3 -m venv venv
-source venv/bin/activate
+./venv/bin/pip install -r requirements.txt
 
-# 3. 安装依赖项
-pip install -r requirements.txt
-```
+# 2. 初始化配置（按需配置 WORKSPACE_ROOT、ALLOWED_USERS、AGY_BINARY 等）
+cp .env.example .env
 
-### 2. 微信登录与环境配置
-
-#### 方式 A：个人号微信扫码直连（推荐，免公网 IP）
-运行腾讯官方 iLink 扫码直连工具：
-```bash
+# 3. 绑定个人微信（iLink Bot 扫码，可选）
 ./venv/bin/python scripts/login_wechat.py
+
+# 4. 启动守护服务并验证健康端点
+bash scripts/wsl_service.sh start
+curl -s http://127.0.0.1:8000/health
+
+# 5. 运行全量自动化测试
+./venv/bin/pytest -v tests/
 ```
-终端将自动渲染登录二维码，并在手机微信扫码确认后自动保存凭证至 `.env`。
-
-#### 方式 B：Webhook 模式
-配置 `.env` 中的相关参数：
-```ini
-WECHAT_CHANNEL="webhook"
-WECHAT_TOKEN="dev_token_123456"
-WECHAT_PUSH_URL="http://127.0.0.1:8000/mock/wechat/push"
-```
-
-### 3. 一键运行与测试验证
-
-```bash
-# 执行全量单元测试与反幻觉测试 (60 测试项, 100% 通过)
-./venv/bin/python -m pytest tests/
-
-# 启动单进程生产服务
-./venv/bin/python main.py
-```
-
----
-
-## 四、 微信端交互指令体验
-
-| 交互类型 | 微信端发送内容示例 | 系统处理流程与行为 |
-|---------|-------------------|-------------------|
-| **L0 状态查询 (0 Token)** | `#状态` 或语音“系统状态” | 命中本地 `skills/scripts/system_status.py`，0 毫秒立即返回 CPU/内存/引擎健康度 |
-| **L0 风控看板 (0 Token)** | `#风控看板` 或语音“风控看板” | 命中本地 `skills/scripts/wind_control_dashboard.py`，返回滑动窗口水位与熔断器状态 |
-| **L0 审计检查 (0 Token)** | `#幻觉审计` 或“反幻觉审计” | 命中本地 `skills/scripts/hallucination_audit.py`，秒级检查工作区文件完整度 |
-| **定向引擎指令** | `@pi` / `@claude` / `@agy` / `@omp` | 显式指定后端所调度的命令行智能体驱动底座 |
-| **原生语音输入识别** | 发送语音：“阿吉查一下系统状态” | 微信自动提取 `Recognition`，归一化纠错为 `agy status` 并命中 L0 规则，秒级响应 |
-| **高频自适应固化** | 连续 3 次询问同一特定运维问题 | 第 3 次执行后自动固化为 L0 正则规则，后续再次询问消耗 0 Token |
-| **周期任务固化** | 每隔固定周期（如整点）请求备份 | 统计间隔 $CV \le 0.25$，自动沉淀至 `scheduler/jobs.json` 定时静默执行 |
-| **未知复杂编程任务** | `请帮我编写一个批量压缩图片的工具` | 判定为新领域任务，调度原生 CLI 智能体自主编写并注册到 `tools/` |
-
----
-
-## 五、 项目工程目录速查
-
-```text
-agyWechat/
-├── gateway/          # 微信通信双网关、原生语音 Recognition 提取纠错与终端净化
-├── compressor/       # L0 认知语义网关、零虚构前置检验、上下文无损压缩
-├── bridge/           # 四大 CLI 原生驱动底座 (agy/pi/claude/omp) 与 PTY 维持
-├── guard/            # 五维反风控状态机 (滑动窗口、拟人延迟、429退避、403硬熔断)
-├── crystallizer/     # 高频意图热点追踪与 L0 正则规则自动固化器 (N>=3)
-├── scheduler/        # 周期性时间序列分析与 Stage-1 纯代码 Cron 调度器 (CV<=0.25)
-├── tools/            # 动态工具注册中心、AST 沙盒试运行、自动版本管理与热加载
-├── skills/           # 四级技能管理体系、L0 运维脚本库、跨智能体同步
-├── sandbox/          # 外置安全沙盒 (阻断越界目录与高危指令，补偿免确认执行)
-├── verifier/         # 四维反幻觉物理校验器 (快照比对、影子运行、四段式履约协议)
-├── memory/           # 核心记忆状态库 (SQLite WAL 模式与 FTS5 BM25 全文检索)
-├── rsi/              # RSI 递归自我演进生命周期引擎与成熟度动态量化
-└── telemetry/        # 系统健康度遥测监控
-```
-
----
-> **项目总结**：`agyWechat` 将工业级的代码工程严谨性与大模型的探索能力深度结合。通过“大模型开路、代码收敛巩固”的 RSI 机制，让智能体越用越快、越用越稳，最终将概率性的大模型调用率降至接近于零，打造真正坚不可摧的自动化生产力工具。

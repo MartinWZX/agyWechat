@@ -37,9 +37,12 @@ def print_ascii_qr(url_or_code: str, qr_img_path: Path) -> None:
         qr.print_ascii(invert=True)
         print("\n" + "=" * 46)
 
-        img = qr.make_image(fill_color="black", back_color="white")
-        img.save(str(qr_img_path))
-        print(f"🖼️ 二维码图片已保存至: {qr_img_path}")
+        try:
+            img = qr.make_image(fill_color="black", back_color="white")
+            img.save(str(qr_img_path))
+            print(f"🖼️ 二维码图片已保存至: {qr_img_path}")
+        except ImportError:
+            return
 
         # Optional: copy to artifact directory if AGY_BRAIN_DIR is set
         brain_env = os.environ.get("AGY_BRAIN_DIR")
@@ -51,19 +54,16 @@ def print_ascii_qr(url_or_code: str, qr_img_path: Path) -> None:
                 except Exception:
                     print(f"⚠️ 无法同步二维码至 brain 目录: {brain_dir}")
 
-        # Optional: auto-detect WSL Windows desktop for visual convenience
-        users_dir = Path("/mnt/c/Users")
-        if users_dir.exists():
-            for u in users_dir.iterdir():
-                if u.is_dir() and u.name not in ("Default", "Public", "All Users", "defaultuser0"):
-                    desktop = u / "Desktop"
-                    if desktop.is_dir():
-                        try:
-                            shutil.copyfile(str(qr_img_path), str(desktop / "wechat_qr.png"))
-                            print(f"🖥️ 二维码已同步放置在桌面: {desktop / 'wechat_qr.png'}")
-                            break
-                        except Exception:
-                            print(f"⚠️ 桌面同步失败，保留本地终端二维码")
+        # Optional: copy to external directory if WECHAT_QR_EXPORT_DIR is set
+        export_dir_env = os.environ.get("WECHAT_QR_EXPORT_DIR")
+        if export_dir_env:
+            export_dir = Path(export_dir_env).expanduser()
+            if export_dir.is_dir():
+                try:
+                    shutil.copyfile(str(qr_img_path), str(export_dir / "wechat_qr.png"))
+                    print(f"🖼️ 二维码已同步导出至: {export_dir / 'wechat_qr.png'}")
+                except OSError:
+                    print(f"⚠️ 导出二维码至目标目录失败: {export_dir}")
     except Exception as e:
         print(f"⚠️ 终端渲染二维码提示: {e}")
         print(f"🌐 请直接在浏览器中打开二维码链接:\n   {url_or_code}\n")
@@ -163,13 +163,16 @@ async def async_login(timeout_seconds: int = 600) -> bool:
 
             env_path = PROJECT_ROOT / ".env"
             allowed_users_val = f'["{user_id}"]' if user_id else '["*"]'
-            update_env_file(env_path, {
+            env_updates = {
                 "WECHAT_CHANNEL": "ilink",
                 "WEIXIN_ACCOUNT_ID": account_id,
                 "WEIXIN_TOKEN": bot_token,
                 "WEIXIN_BASE_URL": base_url,
                 "ALLOWED_USERS": allowed_users_val,
-            })
+            }
+            if user_id:
+                env_updates["ADMIN_USERS"] = allowed_users_val
+            update_env_file(env_path, env_updates)
 
             print("\n" + "=" * 50)
             print("🎉 恭喜！微信端已成功连接绑定！")

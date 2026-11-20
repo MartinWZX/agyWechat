@@ -1,27 +1,36 @@
-"""Claude Code (claude) Driver."""
-from typing import Iterable, List, Optional
+"""Claude Code (claude) Native CLI Driver."""
+from typing import List
+
 from .base_driver import BaseCLIAgentDriver
 
 
 class ClaudeDriver(BaseCLIAgentDriver):
+    """Native Claude Code CLI driver."""
+
+    supports_json_output = True
+    conversation_flag = "--resume"
+
     def __init__(
         self,
         binary_path: str = "claude",
         skip_flag: str = "--dangerously-skip-permissions",
-        default_model: str = "haiku",
-        timeout: int = 60,
-        max_turns: int = 3,
-        lock_file: Optional[str] = None,
-        env_passthrough: Optional[Iterable[str]] = None,
+        default_model: str = "inherit",
+        timeout: int = 0,
+        max_turns: int = 0,
     ):
         super().__init__(
-            "claude", binary_path, skip_flag, default_model, timeout,
-            max_turns=max_turns, lock_file=lock_file, env_passthrough=env_passthrough,
+            "claude",
+            binary_path,
+            skip_flag,
+            default_model,
+            timeout,
+            max_turns=max_turns,
         )
 
     def build_one_liner_cmd(self, prompt: str) -> List[str]:
         cmd = [self.binary_path, "-p", prompt]
         if self.skip_flag:
             cmd.extend(self.skip_flag.split())
-        cmd.extend(["--max-turns", str(self.max_turns)])
+        if self.max_turns and self.max_turns > 0:
+            cmd.extend(["--max-turns", str(self.max_turns)])
         return cmd

@@ -1,4 +1,4 @@
-"""Single Process Entrypoint with flock, Authenticated/Idempotent FastAPI Webhook, Multi-CLI Hub & Governed RSI."""
+"""FastAPI Webhook & Tencent iLink Service Entrypoint for agyWechat Gateway."""
 import asyncio
 from collections import OrderedDict
 import contextlib
@@ -13,23 +13,21 @@ import xml.etree.ElementTree as ET
 from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 import httpx
 
 from bridge.multi_cli_hub import MultiCLIHub
-from config import Settings, get_settings, load_yaml_config
-from crystallizer.pattern_crystallizer import PatternCrystallizer
+from config import Settings, get_settings, load_yaml_config, resolve_setting_or_yaml
 from gateway.ilink_gateway import ILinkGatewayWorker
+from gateway.terminal_cleaner import WeChatSplitter
 from gateway.wechat_gateway import WeChatGateway
-from guard.wind_control_governor import WindControlGovernor
 from memory.core_state_store import CoreStateStore
-from rsi.evolution_engine import EvolutionEngine
-from sandbox.approval_guard import ApprovalGuard
-from scheduler.code_first_cron import CodeFirstCronScheduler
-from skills.skill_manager import SkillManager
 from telemetry.health_monitor import HealthMonitor
 
+if not logging.getLogger().handlers:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
 logger = logging.getLogger("wechat_agy.main")
+
 LOCK_FILE = "/tmp/agent_core/locks/main.lock"
 DEFAULT_DEV_TOKEN = "dev_token_123456"
 MAX_DEDUP_IDS = 1024
@@ -37,7 +35,7 @@ _lock_fd = None
 
 
 def acquire_main_lock() -> Any:
-    """Acquire OS-level flock to ensure global single-process execution."""
+    """Acquire OS-level non-blocking flock to enforce single active server instance."""
     global _lock_fd
     os.makedirs(os.path.dirname(LOCK_FILE), exist_ok=True)
     f = open(LOCK_FILE, "w")
@@ -47,8 +45,19 @@ def acquire_main_lock() -> Any:
         return f
     except OSError:
         f.close()
-        logger.warning("Another instance of autonomous_multi_cli_agent is already running.")
+        logger.warning("Another instance of %s is already running.", APP_NAME)
         return None
+
+
+def release_main_lock(lock_file: Any) -> None:
+    """Release acquired flock synchronously (intended for thread offload on shutdown)."""
+    if lock_file is None:
+        return
+    try:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        lock_file.close()
+    except OSError as err:
+        logger.debug("Lock release exception: %s", err)
 
 
 def compute_wechat_signature(token: str, timestamp: str, nonce: str) -> str:
@@ -85,71 +94,25 @@ def verify_webhook_auth(request: Request, active_settings: Settings) -> None:
 # Runtime wired graph
 settings = get_settings()
 yaml_config = load_yaml_config()
-store = CoreStateStore(settings.DB_PATH)
-skill_manager = SkillManager(workspace_root=settings.WORKSPACE_ROOT, settings=settings)
-approval_guard = ApprovalGuard(store=store, settings=settings)
-governor = WindControlGovernor(store_or_db=store, config_or_settings=settings, config=yaml_config)
-crystallizer = PatternCrystallizer(store=store, skill_manager=skill_manager, settings=settings)
-rsi_engine = EvolutionEngine(
-    store=store,
-    skill_manager=skill_manager,
-    workspace_dir=str(settings.WORKSPACE_ROOT),
-    config=yaml_config,
-)
-hub = MultiCLIHub(
-    config=yaml_config,
-    governor=governor,
-    store=store,
-    evolution_engine=rsi_engine,
-    crystallizer=crystallizer,
-)
-monitor = HealthMonitor(governor=governor, settings=settings, store=store)
+_sys_cfg = yaml_config.get("system", {})
+APP_NAME = str(_sys_cfg.get("app_name", "agyWechat"))
+_effective_db_path = resolve_setting_or_yaml(settings, "DB_PATH", _sys_cfg.get("db_path"), "memory/agent_core.db")
+
+store = CoreStateStore(_effective_db_path)
+hub = MultiCLIHub(config=yaml_config, store=store, settings=settings)
+monitor = HealthMonitor(settings=settings, store=store)
 gateway = WeChatGateway(
     config=yaml_config,
     hub=hub,
     store=store,
-    governor=governor,
-    approval_guard=approval_guard,
-    crystallizer=crystallizer,
-    skill_manager=skill_manager,
     health_monitor=monitor,
     settings=settings,
-    rsi_engine=rsi_engine,
+    db_path=str(_effective_db_path),
 )
 ilink_worker: Optional[ILinkGatewayWorker] = (
     ILinkGatewayWorker(settings=settings, router=gateway) if settings.WEIXIN_TOKEN else None
 )
 
-
-async def _push_cron_notification(target_user: str, text: str) -> None:
-    if ilink_worker is not None:
-        await ilink_worker.pusher.send_raw(target_user, text)
-    elif settings.WECHAT_PUSH_URL and "127.0.0.1:8000/mock/" not in settings.WECHAT_PUSH_URL:
-        headers = {"Content-Type": "application/json"}
-        secret = settings.WECHAT_BOT_SECRET.get_secret_value()
-        if secret:
-            headers["X-Bot-Secret"] = secret
-        try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                await client.post(
-                    settings.WECHAT_PUSH_URL,
-                    json={"to_user": target_user, "content": text},
-                    headers=headers,
-                )
-        except httpx.HTTPError as exc:
-            logger.warning("[Cron Push -> %s] Webhook push failed: %s", target_user, exc)
-    else:
-        logger.info("[Cron Push -> %s] %s", target_user, text)
-
-
-scheduler = CodeFirstCronScheduler(
-    skill_manager=skill_manager,
-    hub=hub,
-    push_message_func=_push_cron_notification,
-    settings=settings,
-    rsi_engine=rsi_engine,
-    health_monitor=monitor,
-)
 _seen_msg_ids: "OrderedDict[str, float]" = OrderedDict()
 
 
@@ -163,62 +126,76 @@ def _is_duplicate_msg(msg_id: str) -> bool:
     return False
 
 
+async def _post_webhook_push(target_user: str, text: str) -> None:
+    """Deliver outbound text chunks to configured non-mock WeChat webhook push URL."""
+    headers = {"Content-Type": "application/json"}
+    secret = settings.WECHAT_BOT_SECRET.get_secret_value()
+    if secret:
+        headers["X-Bot-Secret"] = secret
+    splitter = WeChatSplitter(max_length=settings.WECHAT_MAX_MSG_LEN)
+    chunks = [c for c in splitter.split(text) if c.strip()] or ([text] if text else [])
+    if not chunks:
+        return
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            for chunk in chunks:
+                await client.post(
+                    settings.WECHAT_PUSH_URL,
+                    json={"to_user": target_user, "content": chunk},
+                    headers=headers,
+                )
+    except httpx.HTTPError as exc:
+        logger.warning("[Push -> %s] Webhook push failed: %s", target_user, exc)
+
+
 @contextlib.asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Application lifespan: start background scheduler, RSI daemon, and optional iLink worker."""
+    """Application lifespan: acquire lock, manage optional iLink worker, and clean shutdown."""
     lock = acquire_main_lock()
-    scheduler_task = asyncio.create_task(scheduler.start())
-    rsi_task = asyncio.create_task(rsi_engine.start_daemon())
-    if ilink_worker:
+    if ilink_worker and lock is not None:
         ilink_worker.start()
+    elif ilink_worker and lock is None:
+        logger.warning("Skipping iLink worker startup because another instance holds %s.", LOCK_FILE)
     try:
         yield
     finally:
         if ilink_worker:
             await ilink_worker.stop()
-        scheduler.stop()
-        rsi_engine.stop_daemon()
-        scheduler_task.cancel()
-        rsi_task.cancel()
+        await asyncio.to_thread(store.close)
         if lock:
-            try:
-                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
-                lock.close()
-            except OSError as err:
-                logger.debug("Lock release exception: %s", err)
+            await asyncio.to_thread(release_main_lock, lock)
 
 
 app = FastAPI(
-    title="WeChat-AGY Autonomous Multi-CLI Agent",
-    description="Code-First, LLM-Last Autonomous Multi-CLI Agent System",
+    title="agyWechat Gateway",
+    description="WeChat Lightweight Router + Host Workspace Viewer + 4 Native CLI Engines Gateway",
     lifespan=lifespan,
 )
 
 
 @app.get("/")
 async def root():
-    """Root status endpoint."""
+    """Root gateway metadata endpoint."""
     return {
-        "system": "WeChat-AGY Autonomous Agent",
+        "app_name": APP_NAME,
+        "system": "WeChat Multi-Engine Gateway",
         "status": "operational",
-        "code_offload_ratio": monitor.get_offload_rate(),
-        "rsi_stage": rsi_engine.phase_controller.get_stage_policy().stage.value,
+        "installed_engines": hub.get_installed_engines(),
+        "uptime_seconds": round(time.time() - monitor.start_time, 2),
         "timestamp": time.time(),
     }
 
 
 @app.get("/health")
 async def health():
-    """Health observability endpoint."""
-    policy = rsi_engine.phase_controller.get_stage_policy()
+    """Real gateway health and engine readiness endpoint."""
     return {
         "status": "healthy",
-        "offload_rate": monitor.get_offload_rate(),
+        "uptime_seconds": round(time.time() - monitor.start_time, 2),
         "total_incoming": monitor.total_incoming,
-        "l0_intercepted": monitor.l0_intercepted,
-        "agy_invocations": monitor.agy_invocations,
-        "maturity_score": policy.maturity_score,
-        "rsi_stage": policy.stage.value,
+        "command_hits": monitor.command_hits,
+        "engine_calls": dict(monitor.engine_calls),
+        "installed_engines": hub.get_installed_engines(),
     }
 
 
@@ -228,6 +205,12 @@ async def wechat_webhook_handshake(request: Request):
     verify_webhook_auth(request, settings)
     echostr = request.query_params.get("echostr", "ok")
     return PlainTextResponse(echostr)
+
+
+def _is_xml_payload(text: str) -> bool:
+    """Return True if payload starts with an XML root or XML declaration header."""
+    stripped = (text or "").lstrip()
+    return stripped.startswith("<xml>") or stripped.startswith("<?xml")
 
 
 @app.post("/wechat/webhook")
@@ -244,7 +227,7 @@ async def wechat_webhook(request: Request):
     msg_type = "text"
     msg_id = f"msg_{int(time.time() * 1000)}_{os.urandom(2).hex()}"
 
-    if "json" in content_type:
+    if "json" in content_type.lower():
         try:
             data = json.loads(body_str)
             from_user = str(data.get("from_user", "unknown_user"))
@@ -253,9 +236,9 @@ async def wechat_webhook(request: Request):
             msg_type = str(data.get("msg_type", "text"))
         except ValueError:
             content = body_str
-    elif body_str.lstrip().startswith("<xml>"):
+    elif _is_xml_payload(body_str):
         content = body_str
-        msg_type = "voice"
+        msg_type = "text"
         try:
             root_el = ET.fromstring(body_str.strip())
             user_node = root_el.find("FromUserName")
@@ -266,13 +249,12 @@ async def wechat_webhook(request: Request):
                 msg_id = msg_node.text.strip()
             type_node = root_el.find("MsgType")
             if type_node is not None and type_node.text:
-                msg_type = type_node.text.strip()
+                msg_type = type_node.text.strip().lower()
             if msg_type == "text":
                 txt_node = root_el.find("Content")
-                if txt_node is not None and txt_node.text:
-                    content = txt_node.text.strip()
-        except ET.ParseError:
-            from_user = "xml_user"
+                content = txt_node.text.strip() if txt_node is not None and txt_node.text else ""
+        except ET.ParseError as exc:
+            raise HTTPException(status_code=400, detail="Malformed WeChat XML payload.") from exc
     else:
         content = body_str
 
@@ -280,15 +262,19 @@ async def wechat_webhook(request: Request):
         raise HTTPException(status_code=403, detail="Sender not in ALLOWED_USERS whitelist.")
 
     if _is_duplicate_msg(msg_id):
-        return PlainTextResponse("success")
+        return JSONResponse({"status": "success", "reply": ""})
 
-    if content:
-        await gateway.handle_message(msg_id, from_user, msg_type, content)
+    reply = ""
+    if content or msg_type == "voice":
+        reply = await gateway.handle_message(msg_id, from_user, msg_type, content)
+        if reply and settings.WECHAT_PUSH_URL and "127.0.0.1:8000/mock/" not in settings.WECHAT_PUSH_URL:
+            await _post_webhook_push(from_user, reply)
 
-    return PlainTextResponse("success")
+    return JSONResponse({"status": "success", "reply": reply})
 
 
 if __name__ == "__main__":
     import uvicorn
-    print("[SYSTEM] Starting WeChat-AGY Code-First Autonomous Agent...")
+
+    logger.info("Starting agyWechat Gateway on %s:%s", settings.SERVICE_HOST, settings.SERVICE_PORT)
     uvicorn.run("main:app", host=settings.SERVICE_HOST, port=settings.SERVICE_PORT, log_level="info")

@@ -131,15 +131,18 @@ Thumbs.db
 *.swo
 
 # ==========================================
-# 6. 项目专有运行态令牌、锁文件与动态演化快照
+# 6. 项目专有运行态令牌与锁文件
 # ==========================================
 .context_tokens.json
 .context_tokens.sync_buf
 wechat_qr.png
-tools/tool_execution_trace.jsonl
+QR.png
+qr_*.png
+qr_*.jpg
+login*.png
+itchat.pkl
+wechat*.json
+*.pid
 *.lock
 deploy/backups/
 *.disabled
-skills/scripts/crystallized_*.py
-tools/versions/*.py
-!tools/versions/.gitkeep
