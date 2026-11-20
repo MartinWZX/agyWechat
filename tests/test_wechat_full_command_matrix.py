@@ -166,12 +166,19 @@ async def test_four_engine_matrix_voice_boundary_and_webhook(tmp_path: Path, mon
         assert str(repo.resolve()) in await _send_ilink(worker, sends, "wx_u1", "/pwd")
         assert "src/" in await _send_ilink(worker, sends, "wx_u1", "/ls")
 
-        # 2. Enter /agy -> instant welcome panel; all inputs except /exit /clear /help pass verbatim to CLI
+        # 2. Enter /agy -> instant welcome panel; AI workflow slash commands pass straight to CLI,
+        #    while internal CLI/TUI commands return native internal results in WeChat.
         r_enter_agy = await _send_ilink(worker, sends, "wx_u1", "/agy")
         assert "已进入 [AGY]" in r_enter_agy and "1.5.9" in r_enter_agy and str(repo.resolve()) in r_enter_agy
 
-        for raw_slash in ("/models", "/usage", "/diff", "/open src/main.py", "/plan check", "/hooks", "/add-dir /tmp"):
+        for raw_slash in ("/plan check", "/grill-me arch", "/review src/main.py", "/deep-audit", "/compact"):
             assert f"AGY_ECHO:{raw_slash}" in await _send_ilink(worker, sends, "wx_u1", raw_slash)
+
+        assert "def greet():" in await _send_ilink(worker, sends, "wx_u1", "/open src/main.py")
+        assert "Git 工作区差异" in await _send_ilink(worker, sends, "wx_u1", "/diff")
+        assert "附加工作目录" in await _send_ilink(worker, sends, "wx_u1", "/add-dir /tmp")
+        assert "hooks" in await _send_ilink(worker, sends, "wx_u1", "/hooks")
+        assert "用量与配额" in await _send_ilink(worker, sends, "wx_u1", "/usage")
 
         assert "CREATED calc.py" in await _send_ilink(worker, sends, "wx_u1", "please create calc.py")
         assert "AGY 引擎态" in await _send_ilink(worker, sends, "wx_u1", "/help")

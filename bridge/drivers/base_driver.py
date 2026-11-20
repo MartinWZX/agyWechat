@@ -75,6 +75,7 @@ class BaseCLIAgentDriver(abc.ABC):
 
     supports_json_output: bool = False
     conversation_flag: str = ""
+    supported_flags: Tuple[str, ...] = ()
 
     def __init__(
         self,

@@ -64,8 +64,9 @@ def format_entry_summary(
         f"✅ 已进入 [{eid}] 引擎原生会话（版本: {ver_str}）",
         f"📂 当前工作目录：`{workspace_dir or '.'}`",
         f"🧵 会话状态：{conv_status}",
-        "🎛️ 网关控制命令：仅保留 /exit（退出回路由态）、/clear（清空 conversation_id 开启新对话）、/help（查看帮助）",
-        "💡 100% 原生透传：已开放文本与微信原生语音输入，其余所有文字、语音及斜杠命令均直接交给原生 CLI 处理。",
+        "🎛️ 网关控制：/exit（退出）、/clear（清空重开）、/help（查看帮助与引擎内部命令清单）",
+        "🛠️ 引擎内部命令：支持 /resume、/new、/fork、/model、/mode、/effort、/agent、/add-dir、/diff、/open、/codesearch、/mcp、/plugin、/usage 等（无参触发交互式询问）。",
+        "💡 其余所有自然语言、微信语音及 AI 工作流斜杠命令（如 /plan、/review）均 100% 原生透传 CLI。",
     ]
     return "\n".join(lines)
 
@@ -83,16 +84,26 @@ def format_in_engine_help(
     ws_line = workspace_dir or str(info.get("workspace_dir") or ".")
     conv_line = f"`{conv_id}`（已对话 {turns} 轮）" if conv_id else f"新会话（已对话 {turns} 轮）"
 
+    cfg = info.get("config") if isinstance(info.get("config"), dict) else {}
+    flags_line = ", ".join(
+        f"{k}={v}" for k, v in cfg.items() if v and k != "add_dirs"
+    ) or "默认"
+
     return "\n".join([
-        f"【📘 {engine_id.upper()} 引擎态 · 网关控制说明】",
+        f"【📘 {engine_id.upper()} 引擎态 · 控制与内部命令说明】",
         f"⚙️ 当前引擎：{engine_id.upper()}（版本: {ver}）",
         f"📂 绑定工作目录：`{ws_line}`",
         f"🧵 conversation_id：{conv_line}",
+        f"🎛️ 会话参数：{flags_line}",
         "",
-        "仅保留 3 个网关控制命令：",
         "• /exit — 退出当前引擎，回到非引擎网关路由态",
-        "• /clear — 清空网关记录的 conversation_id（下轮开启全新原生对话）",
+        "• /clear — 清空 conversation_id 开启全新原生对话",
         "• /help — 查看本帮助信息",
         "",
-        "💡 除上述 3 个命令外，所有文本、微信原生语音（Recognition）及其他斜杠命令将 100% 原封不动直传底层原生 CLI。",
+        "引擎内部命令（无参数时支持微信交互式询问，回复 /cancel 可取消）：",
+        "• 会话管理：/resume、/new、/fork、/rename、/rewind、/btw、/context、/copy",
+        "• 模型与参数：/models、/model、/mode、/effort、/agents、/agent、/add-dir、/sandbox、/config",
+        "• 工程与子命令：/diff、/open、/codesearch、/artifact、/projects、/tasks、/mcp、/plugin、/usage、/skills、/hooks、/doctor",
+        "",
+        "💡 除上述命令外，所有自然语言、微信原生语音（Recognition）及 AI 技能命令（如 /plan、/review）将 100% 直传原生 CLI。",
     ])

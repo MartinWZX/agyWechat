@@ -137,17 +137,18 @@ async def test_two_state_engine_fsm_exit_and_instant_entry(tmp_path: Path):
         for passthrough_input in (
             "/plan inspect router",
             "/grill-me architecture",
-            "/diff --stat",
-            "/open main.py",
-            "/models",
-            "/model flash-test",
-            "/add-dir /tmp",
+            "/compact",
+            "/learn",
             "/status",
             "/pi",
             "/unknown_native_slash arg1",
         ):
             r_pt = await gw.process_inbound_message("u1", passthrough_input)
             assert f"OK[1.5.8] first_line={passthrough_input}" in r_pt
+
+        assert "不是 Git 仓库" in await gw.process_inbound_message("u1", "/diff")
+        assert "附加工作目录" in await gw.process_inbound_message("u1", "/add-dir /tmp")
+        assert "已切换为：`flash-test`" in await gw.process_inbound_message("u1", "/model flash-test")
 
         # Verify /clear resets conversation_id cleanly
         r_clear = await gw.process_inbound_message("u1", "/clear")
@@ -201,7 +202,7 @@ async def test_workspace_navigation_external_coding_and_native_sessions(tmp_path
         "        f.write('def add(a, b):\\n    return a + b\\n')\n"
         "    out_conv = conv or 'conv_thread_1'\n"
         "    resp = f'CREATED_CALC in {os.getcwd()}'\n"
-        "elif prompt.startswith('/diff'):\n"
+        "elif prompt.startswith('/plan'):\n"
         "    out_conv = conv or 'conv_thread_1'\n"
         "    resp = f'NATIVE_PASSTHROUGH:{prompt}'\n"
         "elif conv == 'conv_thread_1':\n"
@@ -261,9 +262,11 @@ async def test_workspace_navigation_external_coding_and_native_sessions(tmp_path
         r_t2 = await gw.process_inbound_message("u_ws", "what was my token?")
         assert "RESUMED_MEMORY: TOKEN_Alpha_99" in r_t2
 
-        # 5. Native slash command /diff --stat passes straight through to CLI (zero gateway interception)
-        r_diff = await gw.process_inbound_message("u_ws", "/diff --stat")
-        assert "NATIVE_PASSTHROUGH:/diff --stat" in r_diff
+        # 5. AI workflow slash command /plan check diff passes straight through to CLI; /diff returns git diff
+        r_plan = await gw.process_inbound_message("u_ws", "/plan check diff")
+        assert "NATIVE_PASSTHROUGH:/plan check diff" in r_plan
+        r_diff = await gw.process_inbound_message("u_ws", "/diff")
+        assert "不是 Git 仓库" in r_diff
 
         # 6. /clear resets conversation_id & turn_count while keeping workspace
         r_clear = await gw.process_inbound_message("u_ws", "/clear")
@@ -462,5 +465,132 @@ async def test_multi_user_concurrent_workspaces_and_per_engine_audit_export(tmp_
         assert "每引擎指令审计报告 · ALL" in export_all
         assert "/pi: 总调用 3 次" in export_all
         assert (ws_beta / ".wechat_audit" / "engine_audit_all.json").is_file()
+    finally:
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_internal_engine_commands_and_interactive_wechat_flows(tmp_path: Path):
+    """Verify internal engine commands and multi-turn interactive WeChat selection flows."""
+    import subprocess
+
+    ws = tmp_path / "interact_ws"
+    ws.mkdir()
+    (ws / "calc.py").write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+    subprocess.run(["git", "init", "-q"], cwd=str(ws), check=True)
+    subprocess.run(["git", "config", "user.email", "t@example.local"], cwd=str(ws), check=True)
+    subprocess.run(["git", "config", "user.name", "Tester"], cwd=str(ws), check=True)
+    subprocess.run(["git", "add", "calc.py"], cwd=str(ws), check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=str(ws), check=True)
+    (ws / "calc.py").write_text("def add(a, b):\n    return a + b + 0\n", encoding="utf-8")
+
+    exec_log = tmp_path / "interact_exec.log"
+    cli_bin = tmp_path / "mock_full_agy.py"
+    _write_exec(
+        cli_bin,
+        "import json, sys\n"
+        f"LOG = {str(exec_log)!r}\n"
+        "args = sys.argv[1:]\n"
+        "if '--version' in args: print('agy 1.9.0'); sys.exit(0)\n"
+        "if args and args[0] == 'models':\n"
+        "    print('gemini-4-neon-high\\tGemini 4 Neon\\nflash-test\\tFlash Test'); sys.exit(0)\n"
+        "if args and args[0] == 'agents':\n"
+        "    print('reviewer\\nplanner'); sys.exit(0)\n"
+        "if args and args[0] == 'mcp':\n"
+        "    print(f'MCP_SUBCMD:{args[1:]}'); sys.exit(0)\n"
+        "if args and args[0] == 'plugin':\n"
+        "    print(f'PLUGIN_SUBCMD:{args[1:]}'); sys.exit(0)\n"
+        "with open(LOG, 'a', encoding='utf-8') as f: f.write(json.dumps(args) + '\\n')\n"
+        "conv = args[args.index('--conversation') + 1] if '--conversation' in args else ''\n"
+        "prompt = args[args.index('-p') + 1] if '-p' in args else ''\n"
+        "if prompt == '/usage':\n"
+        "    print(json.dumps({'conversation_id': '', 'response': 'Quota Remaining 99%'})); sys.exit(0)\n"
+        "out_conv = conv or 'thread_alpha_1'\n"
+        "print(json.dumps({'conversation_id': out_conv, 'response': f'ECHO conv={out_conv} prompt={prompt}'}))\n",
+    )
+
+    cfg = {
+        "system": {"workspace_dir": str(ws)},
+        "engines": {"primary": "agy", "agy": {"binary": str(cli_bin), "dangerously_skip_permissions_flag": ""}},
+    }
+    s = Settings(
+        _env_file=None,
+        WORKSPACE_ROOT=ws,
+        DB_PATH=tmp_path / "interact.db",
+        AGY_BINARY=str(cli_bin),
+    )
+    store = CoreStateStore(s.DB_PATH)
+    hub = MultiCLIHub(config=cfg, store=store, settings=s)
+    gw = WeChatGateway(config=cfg, hub=hub, store=store, settings=s)
+
+    try:
+        assert "已进入 [AGY]" in await gw.process_inbound_message("u_int", "/agy")
+
+        # 1. Start thread_alpha_1, rename it, then /clear -> interactive /resume -> reply "1"
+        r1 = await gw.process_inbound_message("u_int", "hello thread 1")
+        assert "conv=thread_alpha_1" in r1
+        assert "已更新为：`Main Thread`" in await gw.process_inbound_message("u_int", "/rename Main Thread")
+        assert "已清空网关记录的 conversation_id" in await gw.process_inbound_message("u_int", "/clear")
+
+        r_res_menu = await gw.process_inbound_message("u_int", "/resume")
+        assert "可恢复的历史会话" in r_res_menu and "thread_alpha_1" in r_res_menu
+        r_res_pick = await gw.process_inbound_message("u_int", "1")
+        assert "已恢复并绑定会话线程 `thread_alpha_1`" in r_res_pick
+        assert "conv=thread_alpha_1" in await gw.process_inbound_message("u_int", "continue thread 1")
+
+        # 2. Interactive /model, /mode, /effort, /agent, /add-dir, and /cancel
+        r_mod_menu = await gw.process_inbound_message("u_int", "/model")
+        assert "gemini-4-neon-high" in r_mod_menu and "flash-test" in r_mod_menu
+        assert "已切换为：`flash-test`" in await gw.process_inbound_message("u_int", "2")
+
+        r_mode_menu = await gw.process_inbound_message("u_int", "/mode")
+        assert "plan" in r_mode_menu
+        assert "`/mode` 已设置为：`plan`" in await gw.process_inbound_message("u_int", "2")
+
+        r_eff_menu = await gw.process_inbound_message("u_int", "/effort")
+        assert "high" in r_eff_menu
+        assert "`/effort` 已设置为：`high`" in await gw.process_inbound_message("u_int", "3")
+
+        r_ag_menu = await gw.process_inbound_message("u_int", "/agent")
+        assert "reviewer" in r_ag_menu
+        assert "已取消当前交互式操作" in await gw.process_inbound_message("u_int", "/cancel")
+
+        # 3. Verify CLI receives --model flash-test --mode plan --effort high --conversation thread_alpha_1
+        assert "ECHO conv=thread_alpha_1 prompt=test flags" in await gw.process_inbound_message("u_int", "test flags")
+        last_args = json.loads(exec_log.read_text(encoding="utf-8").splitlines()[-1])
+        assert "--model" in last_args and "flash-test" in last_args
+        assert "--mode" in last_args and "plan" in last_args
+        assert "--effort" in last_args and "high" in last_args
+        assert "--conversation" in last_args and "thread_alpha_1" in last_args
+
+        # 4. Interactive /btw does NOT pass --conversation or overwrite main conversation_id
+        r_btw_ask = await gw.process_inbound_message("u_int", "/btw")
+        assert "/btw 临时插问" in r_btw_ask
+        r_btw_ans = await gw.process_inbound_message("u_int", "quick side question")
+        assert "prompt=quick side question" in r_btw_ans
+        btw_args = json.loads(exec_log.read_text(encoding="utf-8").splitlines()[-1])
+        assert "--conversation" not in btw_args
+        assert gw.det_router.engine_router.get_session_state("u_int")["meta"]["conversation_id"] == "thread_alpha_1"
+
+        # 5. Interactive /open, /codesearch, /diff, /mcp, /plugin, /usage, /fork, /context, /copy, /skills, /doctor
+        r_open_menu = await gw.process_inbound_message("u_int", "/open")
+        assert "calc.py" in r_open_menu
+        r_open_file = await gw.process_inbound_message("u_int", "1")
+        assert "def add(a, b):" in r_open_file
+
+        assert "工作区代码检索" in await gw.process_inbound_message("u_int", "/codesearch")
+        assert "calc.py:1:def add" in await gw.process_inbound_message("u_int", "def add")
+
+        assert "return a + b + 0" in await gw.process_inbound_message("u_int", "/diff")
+        assert "MCP_SUBCMD:['list']" in await gw.process_inbound_message("u_int", "/mcp")
+        assert "MCP_SUBCMD:['help']" in await gw.process_inbound_message("u_int", "help")
+        assert "PLUGIN_SUBCMD:['list']" in await gw.process_inbound_message("u_int", "/plugin")
+        assert "已取消当前交互式操作" in await gw.process_inbound_message("u_int", "/cancel")
+        assert "Quota Remaining 99%" in await gw.process_inbound_message("u_int", "/usage")
+        assert "thread_alpha_1" in await gw.process_inbound_message("u_int", "/context")
+        assert "最近一条回复原文" in await gw.process_inbound_message("u_int", "/copy")
+        assert "环境诊断" in await gw.process_inbound_message("u_int", "/doctor")
+        assert "已发现技能" in await gw.process_inbound_message("u_int", "/skills")
+        assert "分叉开启新分支" in await gw.process_inbound_message("u_int", "/fork branch-2")
     finally:
         store.close()

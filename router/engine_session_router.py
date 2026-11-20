@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from config import resolve_user_workspaces, resolve_workspace_root
 from memory.core_state_store import CoreStateStore
 from memory.engine_session_repository import EngineSessionRepository
+from router.engine_command_handlers import INTERNAL_ENGINE_COMMANDS, dispatch_internal_engine_command
 from router.engine_session_presenter import (
     NON_ENGINE_HELP_TEXT,
     format_engines_summary,
@@ -124,18 +125,37 @@ class EngineSessionRouter:
             return True, self.workspace_nav.format_ls(user_id, arg)
         return False, ""
 
-    def build_cli_flags(self, active_engine: str, meta: Dict[str, Any]) -> List[str]:
-        """Build minimal native structured-output and session-resumption flags for active engine."""
+    def build_cli_flags(
+        self, active_engine: str, meta: Dict[str, Any], skip_conversation: bool = False
+    ) -> List[str]:
+        """Build session CLI overrides, structured-output, and session-resumption flags."""
         drv = self._get_driver(active_engine)
         if drv is None:
             return []
         flags: List[str] = []
+        supported = set(getattr(drv, "supported_flags", ()) or ())
+        cfg = meta.get("config") or {}
+        if isinstance(cfg, dict):
+            for key in ("model", "mode", "effort", "agent"):
+                flag_name = f"--{key}"
+                val = str(cfg.get(key) or "").strip()
+                if flag_name in supported and val and re.match(r"^[a-zA-Z0-9._:/-]+$", val):
+                    flags.extend([flag_name, val])
+            if "--sandbox" in supported and cfg.get("sandbox"):
+                flags.append("--sandbox")
+            if "--add-dir" in supported:
+                for extra_dir in cfg.get("add_dirs") or []:
+                    d_str = str(extra_dir).strip()
+                    if d_str and "\n" not in d_str and "\x00" not in d_str:
+                        flags.extend(["--add-dir", d_str])
+
         if getattr(drv, "supports_json_output", False):
             flags.extend(["--output-format", "json"])
         conv_flag = str(getattr(drv, "conversation_flag", "") or "").strip()
         conv_id = str(meta.get("conversation_id") or "").strip()
         if (
-            conv_flag in ("--conversation", "--resume")
+            not skip_conversation
+            and conv_flag in ("--conversation", "--resume")
             and conv_id
             and re.match(r"^[a-zA-Z0-9._-]+$", conv_id)
         ):
@@ -288,12 +308,23 @@ class EngineSessionRouter:
     async def route_in_engine(
         self, user_id: str, text: str, state: Dict[str, Any]
     ) -> Optional[RouteDecision]:
-        """Handle strictly /exit, /clear, and /help; pass ALL other inputs straight to native CLI."""
+        """Handle /exit, /clear, /help, interactive replies, and internal engine commands."""
         t = text.strip()
         low = t.lower()
         active_engine = state["active_engine"]
         meta = state.get("meta") or {}
         ws = state.get("workspace_dir") or self.workspace_nav.get_workspace(user_id)
+        pending = meta.get("pending_interaction") if isinstance(meta.get("pending_interaction"), dict) else None
+
+        if pending and low in ("/cancel", "cancel", "取消"):
+            self.session_repo.clear_pending_interaction(user_id)
+            return RouteDecision(
+                True,
+                "✅ 已取消当前交互式操作。",
+                tier=f"T0_ENGINE_INTERACT_CANCEL:{active_engine}",
+                preferred_engine=active_engine,
+                workspace_dir=ws,
+            )
 
         if low == "/exit":
             return self._exit_engine_decision(user_id, active_engine, ws)
@@ -318,4 +349,74 @@ class EngineSessionRouter:
                 workspace_dir=ws,
             )
 
+        drv = self._get_driver(active_engine)
+        if pending and not t.startswith("/"):
+            pending_cmd = str(pending.get("command") or "").strip().lower()
+            if pending_cmd in INTERNAL_ENGINE_COMMANDS:
+                res = await dispatch_internal_engine_command(
+                    pending_cmd,
+                    t,
+                    user_id=user_id,
+                    active_engine=active_engine,
+                    ws=ws,
+                    meta=meta,
+                    drv=drv,
+                    store=self.store,
+                    session_repo=self.session_repo,
+                    workspace_nav=self.workspace_nav,
+                    pending_ctx=pending,
+                )
+                return self._build_command_decision(res, active_engine, meta)
+
+        if t.startswith("/"):
+            parts = t.split(None, 1)
+            cmd_name = parts[0][1:].strip().lower()
+            args_str = parts[1].strip() if len(parts) > 1 else ""
+            if cmd_name in INTERNAL_ENGINE_COMMANDS:
+                if pending:
+                    self.session_repo.clear_pending_interaction(user_id)
+                res = await dispatch_internal_engine_command(
+                    cmd_name,
+                    args_str,
+                    user_id=user_id,
+                    active_engine=active_engine,
+                    ws=ws,
+                    meta=meta,
+                    drv=drv,
+                    store=self.store,
+                    session_repo=self.session_repo,
+                    workspace_nav=self.workspace_nav,
+                )
+                return self._build_command_decision(res, active_engine, meta)
+
         return None
+
+    def _build_command_decision(
+        self, res: Dict[str, Any], active_engine: str, meta: Dict[str, Any]
+    ) -> RouteDecision:
+        handled = bool(res.get("handled", True))
+        ws = str(res.get("workspace_dir") or "")
+        if handled:
+            return RouteDecision(
+                True,
+                str(res.get("reply") or ""),
+                tier=str(res.get("tier") or f"T0_ENGINE_CMD:{active_engine}"),
+                preferred_engine=active_engine,
+                workspace_dir=ws,
+            )
+        drv = self._get_driver(active_engine)
+        q = str(res.get("effective_query") or "")
+        return RouteDecision(
+            False,
+            tier=str(res.get("tier") or f"T3_ENGINE_PASSTHROUGH:{active_engine}"),
+            preferred_engine=active_engine,
+            effective_query=q,
+            base_query=q,
+            strict_engine_pin=True,
+            is_engine_slash=False,
+            workspace_dir=ws,
+            conversation_id=str(meta.get("conversation_id") or ""),
+            session_started_at=float(meta.get("session_started_at") or 0.0),
+            supports_native_session=bool(getattr(drv, "supports_native_session", False)),
+            cli_flags=self.build_cli_flags(active_engine, meta, skip_conversation=bool(res.get("skip_conv"))),
+        )

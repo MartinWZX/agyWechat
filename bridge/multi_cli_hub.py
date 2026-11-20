@@ -138,6 +138,8 @@ class MultiCLIHub:
         if clean_stderr and clean_stderr != clean_stdout:
             parts.append(clean_stderr)
         detail = "\n".join(parts).strip()
+        if "is not available in print mode" in detail:
+            detail += "\n💡 提示：该命令在 CLI 非交互 print 模式下受限；可发送 /help 查看网关已适配的微信交互式命令。"
         msg = (
             f"⚠️ [{target_engine.upper()}] 原生 CLI 返回错误 (exit={returncode}):\n{detail}"
             if detail

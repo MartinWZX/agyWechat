@@ -9,6 +9,7 @@ class OmpDriver(BaseCLIAgentDriver):
 
     supports_json_output = False
     conversation_flag = ""
+    supported_flags = ("--model",)
 
     def __init__(
         self,

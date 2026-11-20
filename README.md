@@ -18,7 +18,7 @@
 
 网关严格遵守**两态分离（Two-State Separation）**，消除无效中间层拦截与误触发：
 - **状态一 · 非引擎路由态（`active_engine == ""`）**：**严禁语音触发 AI**，仅响应文本运维/导航/导出指令；支持图片与文件片段直接落盘至当前绑定工作区。
-- **状态二 · 引擎原生自治态（`active_engine in {"agy","pi","claude","omp"}`）**：网关**仅拦截 `/exit`、`/clear`、`/help`**，其余所有文本、微信原生语音 `Recognition`、任意其他 `/斜杠命令`及图文说明 **100% 携带宿主机完整 `os.environ` 直通 CLI 子进程**。
+- **状态二 · 引擎原生自治态（`active_engine in {"agy","pi","claude","omp"}`）**：网关处理 `/exit`、`/clear`、`/help` 与全量引擎内部 CLI/TUI 命令（如 `/resume`、`/model`、`/mode`、`/effort`、`/diff`、`/open`、`/mcp`、`/plugin`、`/usage`、`/btw` 等，无参数自动触发微信端多轮交互式询问）；其余自然语言、微信原生语音 `Recognition`、AI 技能斜杠命令（如 `/plan`、`/review`）及图文说明 **100% 携带宿主机完整 `os.environ` 直通 CLI 子进程**。
 
 已验证核心能力：
 - **双通道微信接入**：支持个人微信腾讯 iLink Bot（免公网扫码长轮询 + `ContextTokenStore` + `-14/-2` 过期自动重连）与标准 Webhook（`XML` / `<?xml...?>` / `JSON` + SHA-1 / `X-WeChat-Token` 鉴权）。
@@ -45,7 +45,7 @@ agyWechat/
 ├── main.py              # FastAPI 入口 (/, /health, /wechat/webhook, /audit/engines, flock 单实例锁)
 ├── config.py / .yaml    # 配置中心 (.env > config.yaml > Settings 默认值)
 ├── gateway/             # WeChatGateway、iLink 客户端与长轮询工人、ANSICleaner & WeChatSplitter
-├── router/              # DeterministicRouter、EngineSessionRouter、WorkspaceNavigator
+├── router/              # DeterministicRouter、EngineSessionRouter、engine_command_handlers、WorkspaceNavigator
 ├── bridge/              # MultiCLIHub 与四引擎驱动 (agy / pi / claude / omp)
 ├── memory/ & telemetry/ # 双表 SQLite WAL 存储、审计导出与宿主机硬件遥测
 ├── scripts/             # login_wechat.py (iLink 扫码绑定) & wsl_service.sh (守护管理)
@@ -109,8 +109,9 @@ curl -s http://127.0.0.1:8000/health # 健康检查
 | :--- | :--- |
 | `/exit` | 退出当前引擎，退回非引擎路由态（保留当前工作目录） |
 | `/clear` | 清空网关记录的 `conversation_id` 与轮次，下轮开启全新原生会话 |
-| `/help` | 显示当前引擎版本、绑定目录、`conversation_id` 与这 3 个控制命令 |
-| **其余一切文本 / 语音 / 斜杠命令 / 带说明附件** | **100% 直通当前原生 CLI**：语音直取微信 `Recognition`（为空直接报错），带 `caption` 附件先落盘再将路径与说明传给 CLI，输出与 `stderr` 经 ANSI 清洗原样回传 |
+| `/help` | 显示当前引擎版本、绑定目录、`conversation_id` 与内部命令清单 |
+| **引擎内部与交互式命令** | `/resume`、`/new`、`/fork`、`/rename`、`/rewind`、`/btw`、`/model`、`/models`、`/mode`、`/effort`、`/agent`、`/add-dir`、`/diff`、`/open`、`/codesearch`、`/mcp`、`/plugin`、`/usage`、`/skills`、`/doctor` 等直接在微信返回结果；无参数时触发交互式编号询问（回复 `/cancel` 取消） |
+| **其余一切文本 / 语音 / AI 技能斜杠命令 / 带说明附件** | **100% 直通当前原生 CLI**：语音直取微信 `Recognition`（为空直接报错），带 `caption` 附件先落盘再将路径与说明传给 CLI，输出与 `stderr` 经 ANSI 清洗原样回传 |
 
 ---
 

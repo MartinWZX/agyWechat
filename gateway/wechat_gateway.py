@@ -369,7 +369,7 @@ class WeChatGateway:
             progress_callback=progress_callback,
             progress_interval=self.progress_interval,
         )
-        if ok:
+        if ok and not decision.tier.startswith("T3_ENGINE_BTW:"):
             await asyncio.to_thread(
                 self.det_router.engine_router.record_coding_turn,
                 user_id,

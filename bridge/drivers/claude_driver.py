@@ -9,6 +9,7 @@ class ClaudeDriver(BaseCLIAgentDriver):
 
     supports_json_output = True
     conversation_flag = "--resume"
+    supported_flags = ("--model", "--add-dir")
 
     def __init__(
         self,

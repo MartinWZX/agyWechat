@@ -9,6 +9,7 @@ class AgyDriver(BaseCLIAgentDriver):
 
     supports_json_output = True
     conversation_flag = "--conversation"
+    supported_flags = ("--model", "--mode", "--effort", "--agent", "--add-dir", "--sandbox")
 
     def __init__(
         self,
