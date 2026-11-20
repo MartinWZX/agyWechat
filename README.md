@@ -107,10 +107,10 @@ curl -s http://127.0.0.1:8000/health # 健康检查
 
 | 命令 / 输入 | 说明 |
 | :--- | :--- |
-| `/exit` | 退出当前引擎，退回非引擎路由态（保留当前工作目录） |
+| `/exit` \| `/quit` | 退出当前引擎，退回非引擎路由态（保留当前工作目录） |
 | `/clear` | 清空网关记录的 `conversation_id` 与轮次，下轮开启全新原生会话 |
-| `/help` | 显示当前引擎版本、绑定目录、`conversation_id` 与内部命令清单 |
-| **引擎内部与交互式命令** | `/resume`、`/new`、`/fork`、`/rename`、`/rewind`、`/btw`、`/model`、`/models`、`/mode`、`/effort`、`/agent`、`/add-dir`、`/diff`、`/open`、`/codesearch`、`/mcp`、`/plugin`、`/usage`、`/skills`、`/doctor` 等直接在微信返回结果；无参数时触发交互式编号询问（回复 `/cancel` 取消） |
+| `/help` `[命令]` | 显示当前引擎版本、绑定目录、`conversation_id`、内部命令清单或子命令说明 |
+| **引擎内部与交互式命令** | `/resume` (`/conversation`)、`/new`、`/fork` (`/branch`)、`/rename`、`/rewind` (`/undo`)、`/btw`、`/copy` (`n\|btw\|list`)、`/model`、`/models`、`/mode`、`/effort`、`/agent`、`/add-dir`、`/project`、`/diff`、`/open`、`/codesearch` (`/cs`)、`/mcp`、`/plugin`、`/usage` (`/quota`)、`/credits`、`/skills`、`/doctor` 等直接在微信返回结果；无参数时触发交互式询问（回复 `/cancel` 取消） |
 | **其余一切文本 / 语音 / AI 技能斜杠命令 / 带说明附件** | **100% 直通当前原生 CLI**：语音直取微信 `Recognition`（为空直接报错），带 `caption` 附件先落盘再将路径与说明传给 CLI，输出与 `stderr` 经 ANSI 清洗原样回传 |
 
 ---

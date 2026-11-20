@@ -369,14 +369,22 @@ class WeChatGateway:
             progress_callback=progress_callback,
             progress_interval=self.progress_interval,
         )
-        if ok and not decision.tier.startswith("T3_ENGINE_BTW:"):
-            await asyncio.to_thread(
-                self.det_router.engine_router.record_coding_turn,
-                user_id,
-                exec_meta.get("conversation_id"),
-            )
-
         clean_reply = self.cleaner.clean_text(answer).strip()
+        if ok:
+            if decision.tier.startswith("T3_ENGINE_BTW:"):
+                if clean_reply:
+                    await asyncio.to_thread(
+                        self.det_router.engine_router.session_repo.set_last_btw_reply,
+                        user_id,
+                        clean_reply,
+                    )
+            else:
+                await asyncio.to_thread(
+                    self.det_router.engine_router.record_coding_turn,
+                    user_id,
+                    exec_meta.get("conversation_id"),
+                )
+
         final_reply = f"{echo_header}{clean_reply}" if echo_header else clean_reply
         await asyncio.to_thread(
             self.store.record_message,

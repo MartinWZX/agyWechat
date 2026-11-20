@@ -368,4 +368,13 @@ def extract_engine_json_result(raw_stdout: str) -> Tuple[str, Optional[str]]:
         body = _format_cli_command_payload(payload["command"])
     elif not body and payload.get("error"):
         body = str(payload["error"])
+    elif not body and str(payload.get("status") or "").upper() == "SUCCESS":
+        info_parts = []
+        dur = payload.get("duration_seconds")
+        if isinstance(dur, (int, float)) and dur > 0:
+            info_parts.append(f"耗时 {dur:.1f}s")
+        usage = payload.get("usage")
+        if isinstance(usage, dict) and usage.get("total_tokens"):
+            info_parts.append(f"tokens: {usage['total_tokens']}")
+        body = f"✅ 执行完成（上下文已更新，{'，'.join(info_parts)}）" if info_parts else "✅ 执行完成。"
     return (body if body else raw_stdout), conv_id

@@ -9,7 +9,11 @@ from typing import Any, Dict, List, Optional, Tuple
 from config import resolve_user_workspaces, resolve_workspace_root
 from memory.core_state_store import CoreStateStore
 from memory.engine_session_repository import EngineSessionRepository
-from router.engine_command_handlers import INTERNAL_ENGINE_COMMANDS, dispatch_internal_engine_command
+from router.engine_command_handlers import (
+    INTERNAL_ENGINE_COMMANDS,
+    dispatch_internal_engine_command,
+    handle_in_engine_help_topic,
+)
 from router.engine_session_presenter import (
     NON_ENGINE_HELP_TEXT,
     format_engines_summary,
@@ -136,7 +140,7 @@ class EngineSessionRouter:
         supported = set(getattr(drv, "supported_flags", ()) or ())
         cfg = meta.get("config") or {}
         if isinstance(cfg, dict):
-            for key in ("model", "mode", "effort", "agent"):
+            for key in ("model", "mode", "effort", "agent", "project"):
                 flag_name = f"--{key}"
                 val = str(cfg.get(key) or "").strip()
                 if flag_name in supported and val and re.match(r"^[a-zA-Z0-9._:/-]+$", val):
@@ -305,16 +309,32 @@ class EngineSessionRouter:
             workspace_dir=ws,
         )
 
+    @staticmethod
+    def _is_escape_slash_command(text: str, pending_cmd: str) -> bool:
+        """Distinguish real slash commands escaping a pending interaction from Unix paths or search patterns."""
+        t = (text or "").strip()
+        if not t.startswith("/"):
+            return False
+        first = t.split(None, 1)[0][1:].strip().lower()
+        if not first or "/" in first:
+            return False
+        if first in ("cancel", "exit", "quit", "clear", "help") or first in INTERNAL_ENGINE_COMMANDS:
+            return True
+        if pending_cmd in ("add-dir", "projects", "open", "artifact", "codesearch", "cs", "feedback", "btw"):
+            return False
+        return True
+
     async def route_in_engine(
         self, user_id: str, text: str, state: Dict[str, Any]
     ) -> Optional[RouteDecision]:
-        """Handle /exit, /clear, /help, interactive replies, and internal engine commands."""
+        """Handle /exit (/quit), /clear, /help [topic], interactive replies, and internal engine commands."""
         t = text.strip()
         low = t.lower()
         active_engine = state["active_engine"]
         meta = state.get("meta") or {}
         ws = state.get("workspace_dir") or self.workspace_nav.get_workspace(user_id)
         pending = meta.get("pending_interaction") if isinstance(meta.get("pending_interaction"), dict) else None
+        drv = self._get_driver(active_engine)
 
         if pending and low in ("/cancel", "cancel", "取消"):
             self.session_repo.clear_pending_interaction(user_id)
@@ -326,7 +346,7 @@ class EngineSessionRouter:
                 workspace_dir=ws,
             )
 
-        if low == "/exit":
+        if low in ("/exit", "/quit"):
             return self._exit_engine_decision(user_id, active_engine, ws)
 
         if low == "/clear":
@@ -341,6 +361,8 @@ class EngineSessionRouter:
             )
 
         if low == "/help":
+            if pending:
+                self.session_repo.clear_pending_interaction(user_id)
             return RouteDecision(
                 True,
                 format_in_engine_help(active_engine, workspace_dir=ws, meta=meta),
@@ -349,24 +371,38 @@ class EngineSessionRouter:
                 workspace_dir=ws,
             )
 
-        drv = self._get_driver(active_engine)
-        if pending and not t.startswith("/"):
-            pending_cmd = str(pending.get("command") or "").strip().lower()
-            if pending_cmd in INTERNAL_ENGINE_COMMANDS:
-                res = await dispatch_internal_engine_command(
-                    pending_cmd,
-                    t,
-                    user_id=user_id,
-                    active_engine=active_engine,
-                    ws=ws,
-                    meta=meta,
-                    drv=drv,
-                    store=self.store,
-                    session_repo=self.session_repo,
-                    workspace_nav=self.workspace_nav,
-                    pending_ctx=pending,
-                )
-                return self._build_command_decision(res, active_engine, meta)
+        if low.startswith("/help "):
+            if pending:
+                self.session_repo.clear_pending_interaction(user_id)
+            topic_reply = await handle_in_engine_help_topic(
+                t[6:].strip(), active_engine=active_engine, ws=ws, drv=drv
+            )
+            return RouteDecision(
+                True,
+                topic_reply,
+                tier=f"T0_ENGINE_HELP_TOPIC:{active_engine}",
+                preferred_engine=active_engine,
+                workspace_dir=ws,
+            )
+
+        pending_cmd = str(pending.get("command") or "").strip().lower() if pending else ""
+        if pending and pending_cmd in INTERNAL_ENGINE_COMMANDS and not self._is_escape_slash_command(t, pending_cmd):
+            res = await dispatch_internal_engine_command(
+                pending_cmd,
+                t,
+                user_id=user_id,
+                active_engine=active_engine,
+                ws=ws,
+                meta=meta,
+                drv=drv,
+                store=self.store,
+                session_repo=self.session_repo,
+                workspace_nav=self.workspace_nav,
+                pending_ctx=pending,
+            )
+            if not res.get("keep_pending"):
+                self.session_repo.clear_pending_interaction(user_id)
+            return self._build_command_decision(res, active_engine, meta)
 
         if t.startswith("/"):
             parts = t.split(None, 1)
@@ -387,7 +423,12 @@ class EngineSessionRouter:
                     session_repo=self.session_repo,
                     workspace_nav=self.workspace_nav,
                 )
+                if not res.get("keep_pending"):
+                    self.session_repo.clear_pending_interaction(user_id)
                 return self._build_command_decision(res, active_engine, meta)
+
+        if pending:
+            self.session_repo.clear_pending_interaction(user_id)
 
         return None
 
@@ -406,6 +447,21 @@ class EngineSessionRouter:
             )
         drv = self._get_driver(active_engine)
         q = str(res.get("effective_query") or "")
+        flags = self.build_cli_flags(active_engine, meta, skip_conversation=bool(res.get("skip_conv")))
+        extra_flags = [str(f) for f in (res.get("extra_cli_flags") or []) if str(f)]
+        if len(extra_flags) >= 2 and extra_flags[0] == "--model":
+            # Replace persistent session --model when running one-shot `/model <id> <prompt>`.
+            cleaned: List[str] = []
+            i = 0
+            while i < len(flags):
+                if flags[i] == "--model" and i + 1 < len(flags):
+                    i += 2
+                    continue
+                cleaned.append(flags[i])
+                i += 1
+            flags = cleaned + extra_flags
+        elif extra_flags:
+            flags.extend(extra_flags)
         return RouteDecision(
             False,
             tier=str(res.get("tier") or f"T3_ENGINE_PASSTHROUGH:{active_engine}"),
@@ -418,5 +474,5 @@ class EngineSessionRouter:
             conversation_id=str(meta.get("conversation_id") or ""),
             session_started_at=float(meta.get("session_started_at") or 0.0),
             supports_native_session=bool(getattr(drv, "supports_native_session", False)),
-            cli_flags=self.build_cli_flags(active_engine, meta, skip_conversation=bool(res.get("skip_conv"))),
+            cli_flags=flags,
         )

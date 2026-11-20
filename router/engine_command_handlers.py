@@ -10,21 +10,31 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from bridge.drivers.base_driver import extract_engine_json_result, resolve_binary, run_cli_capture
+from gateway.terminal_cleaner import ANSICleaner
 from memory.core_state_store import CoreStateStore
 from memory.engine_session_repository import EngineSessionRepository
 from router.workspace_navigator import FORBIDDEN_DIR_NAMES, SKIP_LS_NAMES, WorkspaceNavigator
 
 MAX_OUTPUT_CHARS = 3200
+_ANSI_CLEANER = ANSICleaner()
 _SAFE_TOKEN_RE = re.compile(r"^[a-zA-Z0-9._:/-]+$")
 _SECRET_KEY_RE = re.compile(r"(token|secret|password|api_key|apikey|cookie|credential|private_key)", re.IGNORECASE)
 
+_COMMAND_ALIASES: Dict[str, str] = {
+    "cs": "codesearch",
+    "branch": "fork",
+    "conversation": "resume",
+    "undo": "rewind",
+    "quota": "usage",
+}
+
 INTERNAL_ENGINE_COMMANDS = frozenset({
-    "resume", "new", "fork", "rename", "title", "rewind", "btw",
-    "models", "model", "mode", "effort", "agents", "agent", "add-dir", "sandbox",
+    "resume", "conversation", "new", "fork", "branch", "rename", "title", "rewind", "undo", "btw",
+    "models", "model", "mode", "effort", "agents", "agent", "add-dir", "sandbox", "project",
     "mcp", "plugin", "plugins", "remote-control", "changelog", "install", "update",
-    "usage", "credits", "skills", "hooks", "permissions", "config", "settings",
+    "usage", "quota", "credits", "skills", "hooks", "permissions", "config", "settings",
     "memory", "doctor", "acp", "mic-serve",
-    "diff", "open", "codesearch", "context", "copy", "artifact", "projects",
+    "diff", "open", "codesearch", "cs", "context", "copy", "artifact", "projects",
     "tasks", "feedback", "statusline", "keybindings", "voice", "record", "logout",
 })
 
@@ -39,6 +49,7 @@ CONFIG_MENU_MAP = {
     "4": "agent",
     "5": "sandbox",
     "6": "add-dir",
+    "7": "project",
 }
 
 TUI_GUIDANCE_NOTES: Dict[str, str] = {
@@ -48,10 +59,52 @@ TUI_GUIDANCE_NOTES: Dict[str, str] = {
     "logout": "🔐 为避免远程误注销宿主机 CLI 凭证，登出操作请在宿主机本地终端执行原生 CLI `/logout`。",
 }
 
+_CLI_SUBCOMMAND_HELP_TOPICS = frozenset({
+    "acp", "agent", "agents", "changelog", "install", "mcp",
+    "mic-serve", "models", "plugin", "plugins", "remote-control",
+})
+
+_TOPIC_HELP_MAP: Dict[str, str] = {
+    "exit": "/exit（或 /quit）：退出当前引擎会话，返回非引擎网关路由态（保留当前工作目录）。",
+    "quit": "/quit（/exit 别名）：退出当前引擎会话，返回非引擎网关路由态。",
+    "clear": "/clear：清空当前会话 conversation_id 与轮次统计，下一条消息开启全新原生对话。",
+    "new": "/new [标题]：归档当前线程并开启全新原生会话。",
+    "resume": "/resume（或 /conversation）[序号|ID|latest]：列出并恢复网关及宿主机 CLI 历史会话线程。",
+    "fork": "/fork（或 /branch）[分支标题]：从当前线程分叉新对话分支，原线程保留在 /resume 列表中。",
+    "rename": "/rename（或 /title）[新标题]：重命名当前会话线程标题（无参数触发交互输入）。",
+    "rewind": "/rewind（或 /undo）[轮数]：回退本地记录的最近 N 轮 AI 对话。",
+    "btw": "/btw [问题]：发起一次性临时插问，不污染主会话 conversation_id，结果可通过 `/copy btw` 复制。",
+    "copy": "/copy [n|btw|list]：获取最近第 n 条 AI 回复或 `/btw` 回答全文（默认第 1 条）。",
+    "model": "/model [模型ID|序号|reset] 或 `/model <模型ID> <提示词>`：切换会话模型，或单次指定模型执行一条提示词。",
+    "mode": "/mode [auto|plan|accept-edits|reset]：设置当前会话执行权限模式（`--mode`）。",
+    "effort": "/effort [low|medium|high|xhigh|max|reset]：设置推理深度（`--effort`）。",
+    "agent": "/agent [智能体名|序号|reset]：切换当前会话 `--agent`。",
+    "sandbox": "/sandbox [on|off]：开启或关闭终端沙箱标志（`--sandbox`）。",
+    "add-dir": "/add-dir [路径|clear]：管理会话附加工作目录（`--add-dir`）。",
+    "project": "/project [项目ID|序号|reset]：查看或绑定当前会话的 `--project` 项目标识。",
+    "projects": "/projects [序号|路径|project <ID>]：列出本地 Git 仓库与宿主项目并交互切换工作目录。",
+    "diff": "/diff [git-diff 参数]：查看当前绑定工作区 Git 状态与差异。",
+    "open": "/open [序号|相对路径]：安全浏览并读取当前工作区（或产物目录）内的文件内容。",
+    "codesearch": "/codesearch（或 /cs）[关键词或正则]：在当前工作区全文检索代码。",
+    "artifact": "/artifact [序号|路径]：列出并查看工作区或当前会话 brain 目录下的 Markdown 产物。",
+    "usage": "/usage（或 /quota）：实时查询模型配额剩余情况。",
+    "credits": "/credits：查询宿主 AGY 账户剩余 AI Credits 积分余额。",
+    "skills": "/skills：列出宿主及工作区已安装的可用技能（`/技能名` 可在对话中直接触发）。",
+    "config": "/config（或 /settings）[1-7|key=value]：查看宿主生效配置并交互修改会话参数。",
+    "update": "/update [confirm]：检查并确认执行宿主机 CLI 版本更新（避免无确认远程变更）。",
+    "doctor": "/doctor：检查宿主机 CLI 路径、版本、工作目录写权限、Git 状态与数据库状态。",
+    "feedback": "/feedback [内容]：记录使用反馈至工作区 `.wechat_audit/feedback.jsonl`。",
+}
+
 
 def _clip(text: str, limit: int = MAX_OUTPUT_CHARS) -> str:
     txt = (text or "").strip()
     return txt if len(txt) <= limit else txt[:limit] + "\n...（输出过长已截断）"
+
+
+def _clean_cli_text(raw: str) -> str:
+    normalized = (raw or "").replace("\r\n", "\n").replace("\r", "\n")
+    return _ANSI_CLEANER.clean_text(normalized)
 
 
 def _mask_secrets(obj: Any) -> Any:
@@ -74,6 +127,8 @@ def _outcome(
     handled: bool = True,
     effective_query: str = "",
     skip_conv: bool = False,
+    keep_pending: bool = False,
+    extra_cli_flags: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     return {
         "handled": handled,
@@ -83,11 +138,36 @@ def _outcome(
         "workspace_dir": ws,
         "effective_query": effective_query,
         "skip_conv": skip_conv,
+        "keep_pending": keep_pending,
+        "extra_cli_flags": list(extra_cli_flags or []),
     }
 
 
 def _agy_home_dir() -> Path:
     return Path.home() / ".gemini" / "antigravity-cli"
+
+
+def _agy_projects_dir() -> Path:
+    return Path.home() / ".gemini" / "config" / "projects"
+
+
+def _load_host_agy_projects() -> List[Dict[str, str]]:
+    """Read host configured project JSON descriptors from ~/.gemini/config/projects/."""
+    pdir = _agy_projects_dir()
+    if not pdir.is_dir():
+        return []
+    out: List[Dict[str, str]] = []
+    for p in sorted(pdir.glob("*.json")):
+        try:
+            data = json.loads(p.read_text(encoding="utf-8", errors="ignore"))
+            if isinstance(data, dict):
+                pid = str(data.get("id") or p.stem).strip()
+                name = str(data.get("name") or pid).strip()
+                if pid:
+                    out.append({"id": pid, "name": name})
+        except (OSError, ValueError):
+            continue
+    return out[:20]
 
 
 def _load_host_agy_conversations(workspace_dir: str, limit: int = 8) -> List[Dict[str, Any]]:
@@ -182,26 +262,52 @@ def collect_resumable_conversations(
     return candidates[:10]
 
 
+async def _probe_native_agy_command(
+    drv: Any, slash_cmd: str, ws: str, active_engine: str, timeout: float = 12.0
+) -> Optional[Dict[str, Any]]:
+    """Execute native `agy --output-format json -p /<cmd>` when supported and return parsed command payload."""
+    if active_engine != "agy":
+        return None
+    resolved = resolve_binary(getattr(drv, "binary_path", "")) if drv else None
+    if not resolved:
+        return None
+    rc, out, _ = await run_cli_capture(
+        [resolved, "--output-format", "json", "-p", slash_cmd], ws, timeout=timeout
+    )
+    if rc != 0 or not (out or "").strip():
+        return None
+    try:
+        payload = json.loads(out.strip())
+    except ValueError:
+        return None
+    if isinstance(payload, dict) and isinstance(payload.get("command"), dict):
+        return payload
+    return None
+
+
 async def _probe_models_list(drv: Any, ws: str) -> Tuple[List[Dict[str, str]], str]:
-    """Query `<binary> models` to obtain live available models."""
+    """Query `<binary> models` to obtain live available models, filtering ANSI/spinner frames."""
     resolved = resolve_binary(getattr(drv, "binary_path", "")) if drv else None
     if not resolved:
         return [], ""
-    rc, out, err = await run_cli_capture([resolved, "models"], ws, timeout=10.0)
-    raw = (out or "").strip()
-    if rc != 0 or not raw or raw.startswith("{"):
-        return [], (err or out or "").strip()
+    rc, out, err = await run_cli_capture([resolved, "models"], ws, timeout=12.0)
+    cleaned = _clean_cli_text(out or "").strip()
+    if rc != 0 or not cleaned or cleaned.startswith("{"):
+        return [], _clean_cli_text(err or out or "").strip()
     models: List[Dict[str, str]] = []
-    for line in raw.splitlines():
+    seen: set[str] = set()
+    for line in cleaned.splitlines():
         s = line.strip()
-        if not s or s.lower().startswith("fetching "):
+        if not s or "fetching " in s.lower():
             continue
         parts = s.split("\t", 1) if "\t" in s else s.split(None, 1)
         mid = parts[0].strip()
+        if not mid or not _SAFE_TOKEN_RE.match(mid) or mid in seen:
+            continue
+        seen.add(mid)
         label = parts[1].strip() if len(parts) > 1 else ""
-        if mid:
-            models.append({"id": mid, "label": label})
-    return models, raw
+        models.append({"id": mid, "label": label})
+    return models, cleaned
 
 
 async def _probe_agents_list(drv: Any, ws: str) -> List[str]:
@@ -213,8 +319,9 @@ async def _probe_agents_list(drv: Any, ws: str) -> List[str]:
         if rc == 0 and out.strip():
             for line in out.splitlines():
                 tok = line.strip().split()[0] if line.strip() else ""
-                if tok and not tok.lower().startswith(("no ", "available", "usage")):
-                    agents.append(tok)
+                if tok and _SAFE_TOKEN_RE.match(tok) and not tok.lower().startswith(("no", "available", "usage")):
+                    if tok not in agents:
+                        agents.append(tok)
     for base in (Path(ws) / ".agents", _agy_home_dir() / "agents"):
         if base.is_dir():
             for p in sorted(base.iterdir()):
@@ -249,24 +356,24 @@ def _list_workspace_files(ws: str, limit: int = 25) -> List[str]:
     return files
 
 
-def _read_safe_file(ws: str, rel_or_path: str) -> str:
+def _read_safe_file(ws: str, rel_or_path: str) -> Tuple[bool, str]:
     root = Path(ws).resolve()
     raw = (rel_or_path or "").strip()
     if not raw or "\x00" in raw:
-        return "⛔ 请提供合法的文件路径。"
+        return False, "⛔ 请提供合法的文件路径。"
     cand = Path(raw).expanduser()
     resolved = (cand if cand.is_absolute() else (root / cand)).resolve()
     if resolved != root and root not in resolved.parents:
         agy_brain = (_agy_home_dir() / "brain").resolve()
         if agy_brain not in resolved.parents:
-            return "⛔ 安全限制：仅允许读取当前绑定工作区（或会话产物目录）内的文件。"
+            return False, "⛔ 安全限制：仅允许读取当前绑定工作区（或会话产物目录）内的文件。"
     if any(part in FORBIDDEN_DIR_NAMES for part in resolved.parts):
-        return f"⛔ 安全限制：禁止访问凭据敏感目录 `{resolved}`。"
+        return False, f"⛔ 安全限制：禁止访问凭据敏感目录 `{resolved}`。"
     if not resolved.is_file():
-        return f"⚠️ 文件不存在：`{resolved}`"
+        return False, f"⚠️ 文件不存在：`{resolved}`"
     content = resolved.read_text(encoding="utf-8", errors="ignore")
     label = str(resolved.relative_to(root)) if root in resolved.parents else resolved.name
-    return f"📄 `{label}`：\n```\n{_clip(content, 2800)}\n```"
+    return True, f"📄 `{label}`：\n```\n{_clip(content, 2800)}\n```"
 
 
 def _list_artifacts(ws: str, conv_id: str) -> List[str]:
@@ -370,7 +477,7 @@ async def _run_subcmd_with_args(
         )
     argv = [resolved, subcmd, *tokens]
     rc, out, err = await run_cli_capture(argv, ws, timeout=timeout)
-    detail = _clip((out or err or "").strip())
+    detail = _clip(_clean_cli_text(out or err or ""))
     header = f"【⚙️ {active_engine.upper()} · `{' '.join([subcmd, *tokens])}`】"
     if rc == 0:
         return _outcome(
@@ -395,6 +502,7 @@ async def _handle_resume_cmd(
     meta: Dict[str, Any],
     session_repo: EngineSessionRepository,
     cached_candidates: Optional[List[Dict[str, Any]]] = None,
+    from_pending: bool = False,
 ) -> Dict[str, Any]:
     candidates = (
         list(cached_candidates)
@@ -418,7 +526,13 @@ async def _handle_resume_cmd(
             lines.append(f"{i}. `{item['id'][:16]}...` (轮/步数:{item['turn_count']}{cur_tag}){title_tag}")
         lines.append("")
         lines.append("👉 请直接回复【序号】（如 `1`）或【会话 ID 前缀】切换恢复（回复 `/cancel` 取消）。")
-        return _outcome("\n".join(lines), tier=f"T0_ENGINE_INTERACT:{active_engine}:resume", active_engine=active_engine, ws=ws)
+        return _outcome(
+            "\n".join(lines),
+            tier=f"T0_ENGINE_INTERACT:{active_engine}:resume",
+            active_engine=active_engine,
+            ws=ws,
+            keep_pending=True,
+        )
 
     chosen: Optional[Dict[str, Any]] = None
     low = arg.lower()
@@ -438,11 +552,13 @@ async def _handle_resume_cmd(
             chosen = {"id": arg, "title": "", "turn_count": 0}
 
     if chosen is None:
+        hint = "请重新回复有效序号或会话 ID 前缀（回复 `/cancel` 取消）。" if from_pending else "发送 `/resume` 查看可恢复会话列表。"
         return _outcome(
-            f"⚠️ 未找到匹配的会话 `{arg}`。发送 `/resume` 查看可恢复会话列表。",
+            f"⚠️ 未找到匹配的会话 `{arg}`。{hint}",
             tier=f"T0_ENGINE_CMD:{active_engine}:resume",
             active_engine=active_engine,
             ws=ws,
+            keep_pending=from_pending,
         )
 
     session_repo.activate_conversation(
@@ -470,6 +586,7 @@ async def _handle_model_cmd(
     drv: Any,
     session_repo: EngineSessionRepository,
     cached_options: Optional[List[str]] = None,
+    from_pending: bool = False,
 ) -> Dict[str, Any]:
     arg = args_str.strip()
     cfg = meta.get("config") or {}
@@ -485,31 +602,66 @@ async def _handle_model_cmd(
                 lbl = f" — {m['label']}" if m.get("label") else ""
                 lines.append(f"{i}. `{m['id']}`{lbl}")
             lines.append("")
-            lines.append("👉 请回复【序号】、【模型 ID】或 `reset` 恢复默认（回复 `/cancel` 取消）。")
+            lines.append("👉 请回复【序号】、【模型 ID】或 `reset` 恢复默认（也可发送 `/model <模型ID> <提示词>` 单次使用；回复 `/cancel` 取消）。")
         else:
             lines.append("👉 请直接回复【目标模型 ID】或 `reset` 恢复默认（回复 `/cancel` 取消）。")
-        return _outcome("\n".join(lines), tier=f"T0_ENGINE_INTERACT:{active_engine}:model", active_engine=active_engine, ws=ws)
+        return _outcome(
+            "\n".join(lines),
+            tier=f"T0_ENGINE_INTERACT:{active_engine}:model",
+            active_engine=active_engine,
+            ws=ws,
+            keep_pending=True,
+        )
 
-    low = arg.lower()
-    if low in ("reset", "default", "clear", "inherit"):
+    parts = arg.split(None, 1)
+    first = parts[0].strip()
+    rest_prompt = parts[1].strip() if len(parts) > 1 else ""
+    low = first.lower()
+
+    if not rest_prompt and low in ("reset", "default", "clear", "inherit"):
         session_repo.update_session_config(user_id, "model", "")
         return _outcome(f"✅ [{active_engine.upper()}] 已恢复默认模型 (`inherit`)。", tier=f"T0_ENGINE_CMD:{active_engine}:model", active_engine=active_engine, ws=ws)
 
     options = list(cached_options or [])
-    if arg.isdigit():
+    if first.isdigit():
         if not options:
             models, _ = await _probe_models_list(drv, ws)
             options = [m["id"] for m in models[:25]]
-        idx = int(arg) - 1
+        idx = int(first) - 1
         if 0 <= idx < len(options):
             target = options[idx]
         else:
-            return _outcome(f"⛔ 序号 `{arg}` 超出可用模型范围，请重新选择或直接输入模型 ID。", tier=f"T0_ENGINE_CMD:{active_engine}:model", active_engine=active_engine, ws=ws)
+            suffix = "（回复 `/cancel` 取消）" if from_pending else ""
+            return _outcome(
+                f"⛔ 序号 `{first}` 超出可用模型范围，请重新选择或直接输入模型 ID{suffix}。",
+                tier=f"T0_ENGINE_CMD:{active_engine}:model",
+                active_engine=active_engine,
+                ws=ws,
+                keep_pending=from_pending,
+            )
     else:
-        target = arg.split()[0].strip()
+        target = first
 
     if not _SAFE_TOKEN_RE.match(target):
-        return _outcome(f"⛔ 非法的模型名称格式：`{target}`。", tier=f"T0_ENGINE_CMD:{active_engine}:model", active_engine=active_engine, ws=ws)
+        return _outcome(
+            f"⛔ 非法的模型名称格式：`{target}`。",
+            tier=f"T0_ENGINE_CMD:{active_engine}:model",
+            active_engine=active_engine,
+            ws=ws,
+            keep_pending=from_pending,
+        )
+
+    if rest_prompt:
+        session_repo.clear_pending_interaction(user_id)
+        return _outcome(
+            "",
+            tier=f"T3_ENGINE_MODEL_ONESHOT:{active_engine}",
+            active_engine=active_engine,
+            ws=ws,
+            handled=False,
+            effective_query=rest_prompt,
+            extra_cli_flags=["--model", target],
+        )
 
     session_repo.update_session_config(user_id, "model", target)
     return _outcome(
@@ -529,6 +681,7 @@ def _handle_enum_flag_cmd(
     ws: str,
     meta: Dict[str, Any],
     session_repo: EngineSessionRepository,
+    from_pending: bool = False,
 ) -> Dict[str, Any]:
     arg = args_str.strip()
     cfg = meta.get("config") or {}
@@ -540,7 +693,13 @@ def _handle_enum_flag_cmd(
             lines.append(f"{i}. `{opt}`")
         lines.append("")
         lines.append("👉 请回复【序号】或【选项名】（回复 `/cancel` 取消）。")
-        return _outcome("\n".join(lines), tier=f"T0_ENGINE_INTERACT:{active_engine}:{cmd_name}", active_engine=active_engine, ws=ws)
+        return _outcome(
+            "\n".join(lines),
+            tier=f"T0_ENGINE_INTERACT:{active_engine}:{cmd_name}",
+            active_engine=active_engine,
+            ws=ws,
+            keep_pending=True,
+        )
 
     chosen = arg.split()[0].strip().lower()
     if chosen.isdigit():
@@ -548,14 +707,28 @@ def _handle_enum_flag_cmd(
         if 0 <= idx < len(options):
             chosen = options[idx]
         else:
-            return _outcome(f"⛔ 序号 `{arg}` 无效，可选：{', '.join(options)}", tier=f"T0_ENGINE_CMD:{active_engine}:{cmd_name}", active_engine=active_engine, ws=ws)
+            suffix = "（请重新回复或发送 `/cancel` 取消）" if from_pending else ""
+            return _outcome(
+                f"⛔ 序号 `{arg}` 无效，可选：{', '.join(options)}{suffix}",
+                tier=f"T0_ENGINE_CMD:{active_engine}:{cmd_name}",
+                active_engine=active_engine,
+                ws=ws,
+                keep_pending=from_pending,
+            )
 
     if chosen in ("reset", "default", "clear", "off") and (cmd_name != "sandbox" or chosen != "off"):
         session_repo.update_session_config(user_id, cmd_name, "")
         return _outcome(f"✅ [{active_engine.upper()}] 已恢复默认 `/{cmd_name}`。", tier=f"T0_ENGINE_CMD:{active_engine}:{cmd_name}", active_engine=active_engine, ws=ws)
 
     if chosen not in options:
-        return _outcome(f"⛔ 无效选项 `{chosen}`，可选：{', '.join(options)}", tier=f"T0_ENGINE_CMD:{active_engine}:{cmd_name}", active_engine=active_engine, ws=ws)
+        suffix = "（请重新回复或发送 `/cancel` 取消）" if from_pending else ""
+        return _outcome(
+            f"⛔ 无效选项 `{chosen}`，可选：{', '.join(options)}{suffix}",
+            tier=f"T0_ENGINE_CMD:{active_engine}:{cmd_name}",
+            active_engine=active_engine,
+            ws=ws,
+            keep_pending=from_pending,
+        )
 
     if cmd_name == "sandbox":
         val: Any = chosen == "on"
@@ -580,6 +753,7 @@ async def _handle_agent_cmd(
     drv: Any,
     session_repo: EngineSessionRepository,
     cached_options: Optional[List[str]] = None,
+    from_pending: bool = False,
 ) -> Dict[str, Any]:
     arg = args_str.strip()
     cfg = meta.get("config") or {}
@@ -592,7 +766,13 @@ async def _handle_agent_cmd(
             lines.append(f"{i}. `{ag}`")
         lines.append("")
         lines.append("👉 请回复【序号】、【智能体名称】或 `reset` 恢复默认（回复 `/cancel` 取消）。")
-        return _outcome("\n".join(lines), tier=f"T0_ENGINE_INTERACT:{active_engine}:agent", active_engine=active_engine, ws=ws)
+        return _outcome(
+            "\n".join(lines),
+            tier=f"T0_ENGINE_INTERACT:{active_engine}:agent",
+            active_engine=active_engine,
+            ws=ws,
+            keep_pending=True,
+        )
 
     low = arg.lower()
     if low in ("reset", "default", "clear"):
@@ -607,12 +787,24 @@ async def _handle_agent_cmd(
         if 0 <= idx < len(options):
             target = options[idx]
         else:
-            return _outcome(f"⛔ 序号 `{arg}` 无效。", tier=f"T0_ENGINE_CMD:{active_engine}:agent", active_engine=active_engine, ws=ws)
+            return _outcome(
+                f"⛔ 序号 `{arg}` 无效。" + ("请重新回复或发送 `/cancel` 取消。" if from_pending else ""),
+                tier=f"T0_ENGINE_CMD:{active_engine}:agent",
+                active_engine=active_engine,
+                ws=ws,
+                keep_pending=from_pending,
+            )
     else:
         target = arg.split()[0].strip()
 
     if not _SAFE_TOKEN_RE.match(target):
-        return _outcome(f"⛔ 非法的智能体名称：`{target}`。", tier=f"T0_ENGINE_CMD:{active_engine}:agent", active_engine=active_engine, ws=ws)
+        return _outcome(
+            f"⛔ 非法的智能体名称：`{target}`。",
+            tier=f"T0_ENGINE_CMD:{active_engine}:agent",
+            active_engine=active_engine,
+            ws=ws,
+            keep_pending=from_pending,
+        )
 
     session_repo.update_session_config(user_id, "agent", target)
     return _outcome(f"✅ [{active_engine.upper()}] 当前会话 `--agent` 已设置为：`{target}`。", tier=f"T0_ENGINE_CMD:{active_engine}:agent", active_engine=active_engine, ws=ws)
@@ -626,6 +818,7 @@ def _handle_add_dir_cmd(
     meta: Dict[str, Any],
     session_repo: EngineSessionRepository,
     workspace_nav: WorkspaceNavigator,
+    from_pending: bool = False,
 ) -> Dict[str, Any]:
     arg = args_str.strip()
     if not arg:
@@ -638,13 +831,20 @@ def _handle_add_dir_cmd(
             tier=f"T0_ENGINE_INTERACT:{active_engine}:add-dir",
             active_engine=active_engine,
             ws=ws,
+            keep_pending=True,
         )
     if arg.lower() in ("clear", "reset"):
         session_repo.update_add_dirs(user_id, clear=True)
         return _outcome("✅ 已清空当前会话的所有 `--add-dir` 附加目录。", tier=f"T0_ENGINE_CMD:{active_engine}:add-dir", active_engine=active_engine, ws=ws)
     ok, resolved, err = workspace_nav.validate_path(user_id, arg)
     if not ok or resolved is None:
-        return _outcome(err, tier=f"T0_ENGINE_CMD:{active_engine}:add-dir", active_engine=active_engine, ws=ws)
+        return _outcome(
+            err + ("\n👉 请重新输入目录路径（或 `/cancel` 取消）。" if from_pending else ""),
+            tier=f"T0_ENGINE_CMD:{active_engine}:add-dir",
+            active_engine=active_engine,
+            ws=ws,
+            keep_pending=from_pending,
+        )
     dirs = session_repo.update_add_dirs(user_id, add_dir=str(resolved))
     return _outcome(
         "✅ 已更新附加工作目录：\n" + "\n".join(f"• `{d}`" for d in dirs),
@@ -661,24 +861,37 @@ def _handle_rewind_cmd(
     ws: str,
     meta: Dict[str, Any],
     session_repo: EngineSessionRepository,
+    from_pending: bool = False,
 ) -> Dict[str, Any]:
     arg = args_str.strip()
     since_ts = float(meta.get("session_started_at") or 0.0)
-    exchanges = session_repo.get_session_exchanges(user_id, active_engine, since_ts=since_ts, limit=10)
+    exchanges = session_repo.get_session_exchanges(user_id, active_engine, since_ts=since_ts, limit=10, only_ai_turns=True)
     if not arg:
         if not exchanges:
-            return _outcome("ℹ️ 当前会话暂无可回退的历史轮次。", tier=f"T0_ENGINE_CMD:{active_engine}:rewind", active_engine=active_engine, ws=ws)
+            return _outcome("ℹ️ 当前会话暂无可回退的 AI 对话轮次。", tier=f"T0_ENGINE_CMD:{active_engine}:rewind", active_engine=active_engine, ws=ws)
         session_repo.set_pending_interaction(user_id, {"command": "rewind", "max_turns": len(exchanges)})
-        lines = [f"【⏪ {active_engine.upper()} · /rewind】（共 {len(exchanges)} 轮）"]
+        lines = [f"【⏪ {active_engine.upper()} · /rewind】（最近 {len(exchanges)} 轮 AI 对话）"]
         for i, ex in enumerate(exchanges, 1):
             preview = ex["prompt"].replace("\n", " ")[:48]
             lines.append(f"{i}. {preview}")
         lines.append("")
         lines.append("👉 请回复要【回退的轮数】（如 `1` 表示撤销最近 1 轮，回复 `/cancel` 取消）。")
-        return _outcome("\n".join(lines), tier=f"T0_ENGINE_INTERACT:{active_engine}:rewind", active_engine=active_engine, ws=ws)
+        return _outcome(
+            "\n".join(lines),
+            tier=f"T0_ENGINE_INTERACT:{active_engine}:rewind",
+            active_engine=active_engine,
+            ws=ws,
+            keep_pending=True,
+        )
 
     if not arg.isdigit() or int(arg) <= 0:
-        return _outcome("⛔ 请输入正整数轮数（例如 `1`）。", tier=f"T0_ENGINE_CMD:{active_engine}:rewind", active_engine=active_engine, ws=ws)
+        return _outcome(
+            "⛔ 请输入正整数轮数（例如 `1`）。" + ("（回复 `/cancel` 取消）" if from_pending else ""),
+            tier=f"T0_ENGINE_CMD:{active_engine}:rewind",
+            active_engine=active_engine,
+            ws=ws,
+            keep_pending=from_pending,
+        )
     res = session_repo.rewind_session_turns(user_id, int(arg))
     return _outcome(
         f"⏪ [{active_engine.upper()}] 已从本地会话记录回退 {res['removed']} 轮（当前轮数：{res['turn_count']}）。\n"
@@ -696,6 +909,7 @@ async def _handle_open_cmd(
     ws: str,
     session_repo: EngineSessionRepository,
     cached_files: Optional[List[str]] = None,
+    from_pending: bool = False,
 ) -> Dict[str, Any]:
     arg = args_str.strip()
     if not arg:
@@ -708,7 +922,13 @@ async def _handle_open_cmd(
             lines.append(f"{i}. `{fname}`")
         lines.append("")
         lines.append("👉 请回复【文件序号】或【相对文件路径】（回复 `/cancel` 取消）。")
-        return _outcome("\n".join(lines), tier=f"T0_ENGINE_INTERACT:{active_engine}:open", active_engine=active_engine, ws=ws)
+        return _outcome(
+            "\n".join(lines),
+            tier=f"T0_ENGINE_INTERACT:{active_engine}:open",
+            active_engine=active_engine,
+            ws=ws,
+            keep_pending=True,
+        )
 
     target = arg
     if arg.isdigit():
@@ -717,9 +937,23 @@ async def _handle_open_cmd(
         if 0 <= idx < len(files):
             target = files[idx]
         else:
-            return _outcome(f"⛔ 文件序号 `{arg}` 无效。", tier=f"T0_ENGINE_CMD:{active_engine}:open", active_engine=active_engine, ws=ws)
-    reply = await asyncio.to_thread(_read_safe_file, ws, target)
-    return _outcome(reply, tier=f"T0_ENGINE_CMD:{active_engine}:open", active_engine=active_engine, ws=ws)
+            return _outcome(
+                f"⛔ 文件序号 `{arg}` 无效（有效范围 1-{len(files)}）。" + ("请重新回复或 `/cancel` 取消。" if from_pending else ""),
+                tier=f"T0_ENGINE_CMD:{active_engine}:open",
+                active_engine=active_engine,
+                ws=ws,
+                keep_pending=from_pending,
+            )
+    ok_read, reply = await asyncio.to_thread(_read_safe_file, ws, target)
+    if not ok_read and from_pending:
+        reply += "\n👉 请重新输入文件路径（或发送 `/cancel` 取消）。"
+    return _outcome(
+        reply,
+        tier=f"T0_ENGINE_CMD:{active_engine}:open",
+        active_engine=active_engine,
+        ws=ws,
+        keep_pending=(not ok_read and from_pending),
+    )
 
 
 async def _handle_codesearch_cmd(
@@ -737,6 +971,7 @@ async def _handle_codesearch_cmd(
             tier=f"T0_ENGINE_INTERACT:{active_engine}:codesearch",
             active_engine=active_engine,
             ws=ws,
+            keep_pending=True,
         )
     if "\x00" in q:
         return _outcome("⛔ 搜索词包含非法空字节。", tier=f"T0_ENGINE_CMD:{active_engine}:codesearch", active_engine=active_engine, ws=ws)
@@ -785,6 +1020,7 @@ async def _handle_artifact_cmd(
     meta: Dict[str, Any],
     session_repo: EngineSessionRepository,
     cached_files: Optional[List[str]] = None,
+    from_pending: bool = False,
 ) -> Dict[str, Any]:
     arg = args_str.strip()
     conv_id = str(meta.get("conversation_id") or "").strip()
@@ -797,7 +1033,13 @@ async def _handle_artifact_cmd(
         for i, f in enumerate(files, 1):
             lines.append(f"{i}. `{f}`")
         lines.append("\n👉 请回复【序号】或【文件路径】查看内容（回复 `/cancel` 取消）。")
-        return _outcome("\n".join(lines), tier=f"T0_ENGINE_INTERACT:{active_engine}:artifact", active_engine=active_engine, ws=ws)
+        return _outcome(
+            "\n".join(lines),
+            tier=f"T0_ENGINE_INTERACT:{active_engine}:artifact",
+            active_engine=active_engine,
+            ws=ws,
+            keep_pending=True,
+        )
 
     target = arg
     if arg.isdigit():
@@ -806,8 +1048,90 @@ async def _handle_artifact_cmd(
         if 0 <= idx < len(files):
             target = files[idx]
         else:
-            return _outcome(f"⛔ 产物序号 `{arg}` 无效。", tier=f"T0_ENGINE_CMD:{active_engine}:artifact", active_engine=active_engine, ws=ws)
-    return _outcome(await asyncio.to_thread(_read_safe_file, ws, target), tier=f"T0_ENGINE_CMD:{active_engine}:artifact", active_engine=active_engine, ws=ws)
+            return _outcome(
+                f"⛔ 产物序号 `{arg}` 无效。" + ("请重新回复或 `/cancel` 取消。" if from_pending else ""),
+                tier=f"T0_ENGINE_CMD:{active_engine}:artifact",
+                active_engine=active_engine,
+                ws=ws,
+                keep_pending=from_pending,
+            )
+    ok_read, reply = await asyncio.to_thread(_read_safe_file, ws, target)
+    if not ok_read and from_pending:
+        reply += "\n👉 请重新输入产物路径（或发送 `/cancel` 取消）。"
+    return _outcome(
+        reply,
+        tier=f"T0_ENGINE_CMD:{active_engine}:artifact",
+        active_engine=active_engine,
+        ws=ws,
+        keep_pending=(not ok_read and from_pending),
+    )
+
+
+async def _handle_project_cmd(
+    user_id: str,
+    args_str: str,
+    active_engine: str,
+    ws: str,
+    meta: Dict[str, Any],
+    session_repo: EngineSessionRepository,
+    cached_options: Optional[List[str]] = None,
+    from_pending: bool = False,
+) -> Dict[str, Any]:
+    arg = args_str.strip()
+    cfg = meta.get("config") or {}
+    current = str(cfg.get("project") or "默认")
+    if not arg:
+        projs = await asyncio.to_thread(_load_host_agy_projects)
+        opt_ids = [p["id"] for p in projs]
+        session_repo.set_pending_interaction(user_id, {"command": "project", "options": opt_ids})
+        lines = [f"【🗂️ {active_engine.upper()} · /project (`--project`)】（当前：{current}）"]
+        if projs:
+            for i, p in enumerate(projs, 1):
+                lines.append(f"{i}. `{p['id']}` — {p['name']}")
+        else:
+            lines.append("（宿主 ~/.gemini/config/projects/ 暂无已配置项目）")
+        lines.append("\n👉 请回复【序号】、【项目 ID】或 `reset` 清除（回复 `/cancel` 取消）。")
+        return _outcome(
+            "\n".join(lines),
+            tier=f"T0_ENGINE_INTERACT:{active_engine}:project",
+            active_engine=active_engine,
+            ws=ws,
+            keep_pending=True,
+        )
+
+    low = arg.lower()
+    if low in ("reset", "default", "clear"):
+        session_repo.update_session_config(user_id, "project", "")
+        return _outcome(f"✅ [{active_engine.upper()}] 已恢复默认 `--project`。", tier=f"T0_ENGINE_CMD:{active_engine}:project", active_engine=active_engine, ws=ws)
+
+    options = list(cached_options or [])
+    if arg.isdigit():
+        if not options:
+            options = [p["id"] for p in await asyncio.to_thread(_load_host_agy_projects)]
+        idx = int(arg) - 1
+        if 0 <= idx < len(options):
+            target = options[idx]
+        else:
+            return _outcome(
+                f"⛔ 项目编号 `{arg}` 无效。" + ("请重新回复或 `/cancel` 取消。" if from_pending else ""),
+                tier=f"T0_ENGINE_CMD:{active_engine}:project",
+                active_engine=active_engine,
+                ws=ws,
+                keep_pending=from_pending,
+            )
+    else:
+        target = arg.split()[0].strip()
+
+    if not _SAFE_TOKEN_RE.match(target):
+        return _outcome(f"⛔ 非法的项目 ID：`{target}`。", tier=f"T0_ENGINE_CMD:{active_engine}:project", active_engine=active_engine, ws=ws, keep_pending=from_pending)
+
+    session_repo.update_session_config(user_id, "project", target)
+    return _outcome(
+        f"✅ [{active_engine.upper()}] 当前会话 `--project` 已绑定为：`{target}`。",
+        tier=f"T0_ENGINE_CMD:{active_engine}:project",
+        active_engine=active_engine,
+        ws=ws,
+    )
 
 
 async def _handle_projects_cmd(
@@ -815,22 +1139,44 @@ async def _handle_projects_cmd(
     args_str: str,
     active_engine: str,
     ws: str,
+    meta: Dict[str, Any],
     session_repo: EngineSessionRepository,
     workspace_nav: WorkspaceNavigator,
     cached_projects: Optional[List[str]] = None,
+    from_pending: bool = False,
 ) -> Dict[str, Any]:
     arg = args_str.strip()
     if not arg:
         repos = await asyncio.to_thread(_list_git_projects, ws)
-        if not repos:
+        host_projs = await asyncio.to_thread(_load_host_agy_projects) if active_engine == "agy" else []
+        if not repos and not host_projs:
             return _outcome(f"📁 `{ws}` 及其父目录下暂未发现 Git 项目。", tier=f"T0_ENGINE_CMD:{active_engine}:projects", active_engine=active_engine, ws=ws)
         session_repo.set_pending_interaction(user_id, {"command": "projects", "projects": repos})
-        lines = [f"【📁 {active_engine.upper()} · 可切换 Git 项目】（当前：`{ws}`）"]
-        for i, r in enumerate(repos, 1):
-            cur = " [当前]" if r == str(Path(ws).resolve()) else ""
-            lines.append(f"{i}. `{r}`{cur}")
-        lines.append("\n👉 请直接回复【项目序号】或【路径】切换当前会话工作目录（回复 `/cancel` 取消）。")
-        return _outcome("\n".join(lines), tier=f"T0_ENGINE_INTERACT:{active_engine}:projects", active_engine=active_engine, ws=ws)
+        lines = [f"【📁 {active_engine.upper()} · 可切换项目】（当前工作区：`{ws}`）"]
+        if repos:
+            for i, r in enumerate(repos, 1):
+                cur = " [当前]" if r == str(Path(ws).resolve()) else ""
+                lines.append(f"{i}. `{r}`{cur}")
+        if host_projs:
+            cur_proj = str((meta.get("config") or {}).get("project") or "默认")
+            lines.append("")
+            lines.append(f"☁️ 原生 {active_engine.upper()} 项目配置（当前 `--project`: `{cur_proj}`）：")
+            for hp in host_projs:
+                lines.append(f"• `{hp['id']}` — {hp['name']}")
+            lines.append("💡 发送 `project <ID>` 绑定 `--project`，或 `project reset` 清除。")
+        lines.append("\n👉 请直接回复【Git 项目序号】或【目录路径】切换工作区（回复 `/cancel` 取消）。")
+        return _outcome(
+            "\n".join(lines),
+            tier=f"T0_ENGINE_INTERACT:{active_engine}:projects",
+            active_engine=active_engine,
+            ws=ws,
+            keep_pending=True,
+        )
+
+    low = arg.lower()
+    if low == "project" or low.startswith("project "):
+        sub_arg = arg[7:].strip()
+        return await _handle_project_cmd(user_id, sub_arg, active_engine, ws, meta, session_repo, from_pending=from_pending)
 
     target = arg
     if arg.isdigit():
@@ -839,11 +1185,23 @@ async def _handle_projects_cmd(
         if 0 <= idx < len(repos):
             target = repos[idx]
         else:
-            return _outcome(f"⛔ 项目序号 `{arg}` 无效。", tier=f"T0_ENGINE_CMD:{active_engine}:projects", active_engine=active_engine, ws=ws)
+            return _outcome(
+                f"⛔ 项目序号 `{arg}` 无效。" + ("请重新回复或 `/cancel` 取消。" if from_pending else ""),
+                tier=f"T0_ENGINE_CMD:{active_engine}:projects",
+                active_engine=active_engine,
+                ws=ws,
+                keep_pending=from_pending,
+            )
 
     ok, resolved, err = workspace_nav.validate_path(user_id, target)
     if not ok or resolved is None:
-        return _outcome(err, tier=f"T0_ENGINE_CMD:{active_engine}:projects", active_engine=active_engine, ws=ws)
+        return _outcome(
+            err + ("\n👉 请重新输入合法项目路径（或 `/cancel` 取消）。" if from_pending else ""),
+            tier=f"T0_ENGINE_CMD:{active_engine}:projects",
+            active_engine=active_engine,
+            ws=ws,
+            keep_pending=from_pending,
+        )
     saved = session_repo.set_workspace_dir(user_id, str(resolved))
     return _outcome(
         f"✅ [{active_engine.upper()}] 当前工作目录已切换至：`{saved}`。",
@@ -853,17 +1211,25 @@ async def _handle_projects_cmd(
     )
 
 
-async def _handle_usage_cmd(active_engine: str, ws: str, meta: Dict[str, Any], drv: Any) -> Dict[str, Any]:
+async def _handle_usage_cmd(
+    cmd_name: str, active_engine: str, ws: str, meta: Dict[str, Any], drv: Any
+) -> Dict[str, Any]:
+    target_slash = "/credits" if cmd_name == "credits" else "/usage"
+    title = (
+        f"💳 {active_engine.upper()} · AI Credits 积分余额"
+        if cmd_name == "credits"
+        else f"📊 {active_engine.upper()} · 用量与配额"
+    )
     resolved = resolve_binary(getattr(drv, "binary_path", "")) if drv else None
     if resolved and active_engine in ("agy", "claude"):
-        argv = [resolved, "--output-format", "json", "-p", "/usage"]
-        rc, out, _ = await run_cli_capture(argv, ws, timeout=8.0)
+        argv = [resolved, "--output-format", "json", "-p", target_slash]
+        rc, out, _ = await run_cli_capture(argv, ws, timeout=12.0)
         if rc == 0 and out.strip():
             txt, _ = extract_engine_json_result(out)
             if txt.strip():
                 return _outcome(
-                    f"【📊 {active_engine.upper()} · 用量与配额】\n{_clip(txt.strip())}",
-                    tier=f"T0_ENGINE_CMD:{active_engine}:usage",
+                    f"【{title}】\n{_clip(txt.strip())}",
+                    tier=f"T0_ENGINE_CMD:{active_engine}:{cmd_name}",
                     active_engine=active_engine,
                     ws=ws,
                 )
@@ -871,9 +1237,120 @@ async def _handle_usage_cmd(active_engine: str, ws: str, meta: Dict[str, Any], d
     cid = str(meta.get("conversation_id") or "尚未创建")
     return _outcome(
         f"【📊 {active_engine.upper()} · 会话统计】\n• 当前会话 ID：`{cid}`\n• 累计轮数：{turns}",
-        tier=f"T0_ENGINE_CMD:{active_engine}:usage",
+        tier=f"T0_ENGINE_CMD:{active_engine}:{cmd_name}",
         active_engine=active_engine,
         ws=ws,
+    )
+
+
+async def _handle_copy_cmd(
+    user_id: str,
+    args_str: str,
+    active_engine: str,
+    ws: str,
+    meta: Dict[str, Any],
+    session_repo: EngineSessionRepository,
+    from_pending: bool = False,
+) -> Dict[str, Any]:
+    arg = args_str.strip()
+    low = arg.lower()
+    since_ts = float(meta.get("session_started_at") or 0.0)
+    btw_reply = str(meta.get("last_btw_reply") or "").strip()
+
+    if low == "list":
+        exchanges = await asyncio.to_thread(
+            session_repo.get_session_exchanges, user_id, active_engine, since_ts, 10, True
+        )
+        valid = [ex for ex in reversed(exchanges) if ex["reply"].strip()]
+        if not valid and not btw_reply:
+            return _outcome("ℹ️ 当前会话暂无可复制的 AI 回复。", tier=f"T0_ENGINE_CMD:{active_engine}:copy", active_engine=active_engine, ws=ws)
+        session_repo.set_pending_interaction(user_id, {"command": "copy"})
+        lines = [f"【📋 {active_engine.upper()} · 选择要复制的回复】"]
+        for i, ex in enumerate(valid[:8], 1):
+            preview = ex["reply"].replace("\n", " ")[:48]
+            lines.append(f"{i}. {preview}")
+        if btw_reply:
+            lines.append(f"• `btw` — {btw_reply.replace(chr(10), ' ')[:48]}")
+        lines.append("\n👉 请回复【序号】或 `btw` 获取原文（回复 `/cancel` 取消）。")
+        return _outcome(
+            "\n".join(lines),
+            tier=f"T0_ENGINE_INTERACT:{active_engine}:copy",
+            active_engine=active_engine,
+            ws=ws,
+            keep_pending=True,
+        )
+
+    if low == "btw":
+        if not btw_reply:
+            return _outcome("ℹ️ 当前会话暂无可复制的 `/btw` 临时插问回复。", tier=f"T0_ENGINE_CMD:{active_engine}:copy", active_engine=active_engine, ws=ws)
+        return _outcome(
+            f"📋 最近一次 `/btw` 回复原文（长按即可复制）：\n\n{btw_reply}",
+            tier=f"T0_ENGINE_CMD:{active_engine}:copy",
+            active_engine=active_engine,
+            ws=ws,
+        )
+
+    exchanges = await asyncio.to_thread(
+        session_repo.get_session_exchanges, user_id, active_engine, since_ts, 20, True
+    )
+    non_empty = [ex for ex in reversed(exchanges) if ex["reply"].strip()]
+    if not arg:
+        if non_empty:
+            return _outcome(
+                f"📋 最近一条回复原文（长按即可复制）：\n\n{non_empty[0]['reply']}",
+                tier=f"T0_ENGINE_CMD:{active_engine}:copy",
+                active_engine=active_engine,
+                ws=ws,
+            )
+        return _outcome("ℹ️ 当前会话暂无可复制的最近一条 AI 回复。", tier=f"T0_ENGINE_CMD:{active_engine}:copy", active_engine=active_engine, ws=ws)
+
+    if not arg.isdigit() or int(arg) <= 0:
+        return _outcome(
+            "⛔ `/copy` 仅支持无参数、正整数序号 `n`、`btw` 或 `list`。" + ("（回复 `/cancel` 取消）" if from_pending else ""),
+            tier=f"T0_ENGINE_CMD:{active_engine}:copy",
+            active_engine=active_engine,
+            ws=ws,
+            keep_pending=from_pending,
+        )
+    idx = int(arg) - 1
+    if idx >= len(non_empty):
+        return _outcome(
+            f"ℹ️ 当前会话仅有 {len(non_empty)} 条 AI 回复，无法获取第 {arg} 条。",
+            tier=f"T0_ENGINE_CMD:{active_engine}:copy",
+            active_engine=active_engine,
+            ws=ws,
+            keep_pending=from_pending,
+        )
+    header = "📋 最近一条回复原文（长按即可复制）：" if idx == 0 else f"📋 倒数第 {arg} 条回复原文（长按即可复制）："
+    return _outcome(
+        f"{header}\n\n{non_empty[idx]['reply']}",
+        tier=f"T0_ENGINE_CMD:{active_engine}:copy",
+        active_engine=active_engine,
+        ws=ws,
+    )
+
+
+async def handle_in_engine_help_topic(
+    topic: str,
+    *,
+    active_engine: str,
+    ws: str,
+    drv: Any,
+) -> str:
+    """Provide focused CLI subcommand `--help` or gateway command documentation for `/help <topic>`."""
+    clean = (topic or "").strip().lstrip("/").lower()
+    canonical = _COMMAND_ALIASES.get(clean, clean)
+    if clean in _CLI_SUBCOMMAND_HELP_TOPICS and drv is not None:
+        res = await _run_subcmd_with_args(drv, "help", clean, ws, active_engine, timeout=8.0)
+        return res["reply"]
+    if clean in _TOPIC_HELP_MAP:
+        return f"【📘 {active_engine.upper()} · `/{clean}`】\n{_TOPIC_HELP_MAP[clean]}"
+    if canonical in _TOPIC_HELP_MAP:
+        return f"【📘 {active_engine.upper()} · `/{clean}`】\n{_TOPIC_HELP_MAP[canonical]}"
+    return (
+        f"【📘 {active_engine.upper()} · `/{clean}`】\n"
+        f"• 若为 AI 技能或工作流命令（如 `/plan`、`/compact`、`/swarm`），发送 `/{clean} ...` 将 100% 原生透传至 `{active_engine}` CLI。\n"
+        "• 发送 `/help` 查看全部网关与引擎内部命令清单。"
     )
 
 
@@ -892,7 +1369,9 @@ async def dispatch_internal_engine_command(
     pending_ctx: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Execute an internal engine CLI/TUI command or initiate multi-turn WeChat interactive prompt."""
+    from_pending = pending_ctx is not None
     ctx = pending_ctx or {}
+    cmd_name = _COMMAND_ALIASES.get(cmd_name, cmd_name)
 
     if cmd_name == "resume":
         return await _handle_resume_cmd(
@@ -903,6 +1382,7 @@ async def dispatch_internal_engine_command(
             meta,
             session_repo,
             cached_candidates=ctx.get("candidates"),
+            from_pending=from_pending,
         )
 
     if cmd_name == "new":
@@ -935,6 +1415,7 @@ async def dispatch_internal_engine_command(
                 tier=f"T0_ENGINE_INTERACT:{active_engine}:rename",
                 active_engine=active_engine,
                 ws=ws,
+                keep_pending=True,
             )
         updated = session_repo.set_session_title(user_id, args_str)
         return _outcome(
@@ -945,7 +1426,7 @@ async def dispatch_internal_engine_command(
         )
 
     if cmd_name == "rewind":
-        return _handle_rewind_cmd(user_id, args_str, active_engine, ws, meta, session_repo)
+        return _handle_rewind_cmd(user_id, args_str, active_engine, ws, meta, session_repo, from_pending=from_pending)
 
     if cmd_name == "btw":
         q = args_str.strip()
@@ -956,6 +1437,7 @@ async def dispatch_internal_engine_command(
                 tier=f"T0_ENGINE_INTERACT:{active_engine}:btw",
                 active_engine=active_engine,
                 ws=ws,
+                keep_pending=True,
             )
         session_repo.clear_pending_interaction(user_id)
         return _outcome(
@@ -975,21 +1457,31 @@ async def dispatch_internal_engine_command(
             for m in models:
                 lbl = f" — {m['label']}" if m.get("label") else ""
                 lines.append(f"• `{m['id']}`{lbl}")
-            lines.append("\n👉 发送 `/model` 可交互式切换当前会话模型。")
+            lines.append("\n👉 发送 `/model` 可交互式切换当前会话模型，或 `/model <模型ID> <提示词>` 单次使用。")
             return _outcome("\n".join(lines), tier=f"T0_ENGINE_CMD:{active_engine}:models", active_engine=active_engine, ws=ws)
         return _outcome(raw or f"ℹ️ `{active_engine}` 未返回模型清单，可发送 `/model <模型名>` 手动设置。", tier=f"T0_ENGINE_CMD:{active_engine}:models", active_engine=active_engine, ws=ws)
 
     if cmd_name == "model":
-        return await _handle_model_cmd(user_id, args_str, active_engine, ws, meta, drv, session_repo, cached_options=ctx.get("options"))
+        return await _handle_model_cmd(
+            user_id,
+            args_str,
+            active_engine,
+            ws,
+            meta,
+            drv,
+            session_repo,
+            cached_options=ctx.get("options"),
+            from_pending=from_pending,
+        )
 
     if cmd_name == "mode":
-        return _handle_enum_flag_cmd("mode", MODE_OPTIONS, user_id, args_str, active_engine, ws, meta, session_repo)
+        return _handle_enum_flag_cmd("mode", MODE_OPTIONS, user_id, args_str, active_engine, ws, meta, session_repo, from_pending=from_pending)
 
     if cmd_name == "effort":
-        return _handle_enum_flag_cmd("effort", EFFORT_OPTIONS, user_id, args_str, active_engine, ws, meta, session_repo)
+        return _handle_enum_flag_cmd("effort", EFFORT_OPTIONS, user_id, args_str, active_engine, ws, meta, session_repo, from_pending=from_pending)
 
     if cmd_name == "sandbox":
-        return _handle_enum_flag_cmd("sandbox", SANDBOX_OPTIONS, user_id, args_str, active_engine, ws, meta, session_repo)
+        return _handle_enum_flag_cmd("sandbox", SANDBOX_OPTIONS, user_id, args_str, active_engine, ws, meta, session_repo, from_pending=from_pending)
 
     if cmd_name == "agents":
         agents = await _probe_agents_list(drv, ws)
@@ -1002,10 +1494,32 @@ async def dispatch_internal_engine_command(
         )
 
     if cmd_name == "agent":
-        return await _handle_agent_cmd(user_id, args_str, active_engine, ws, meta, drv, session_repo, cached_options=ctx.get("options"))
+        return await _handle_agent_cmd(
+            user_id,
+            args_str,
+            active_engine,
+            ws,
+            meta,
+            drv,
+            session_repo,
+            cached_options=ctx.get("options"),
+            from_pending=from_pending,
+        )
 
     if cmd_name == "add-dir":
-        return _handle_add_dir_cmd(user_id, args_str, active_engine, ws, meta, session_repo, workspace_nav)
+        return _handle_add_dir_cmd(user_id, args_str, active_engine, ws, meta, session_repo, workspace_nav, from_pending=from_pending)
+
+    if cmd_name == "project":
+        return await _handle_project_cmd(
+            user_id,
+            args_str,
+            active_engine,
+            ws,
+            meta,
+            session_repo,
+            cached_options=ctx.get("options"),
+            from_pending=from_pending,
+        )
 
     if cmd_name == "mcp":
         if not args_str.strip():
@@ -1016,20 +1530,36 @@ async def dispatch_internal_engine_command(
                 tier=f"T0_ENGINE_INTERACT:{active_engine}:mcp",
                 active_engine=active_engine,
                 ws=ws,
+                keep_pending=True,
             )
         return await _run_subcmd_with_args(drv, "mcp", args_str, ws, active_engine)
 
     if cmd_name in ("plugin", "plugins"):
-        if not args_str.strip():
+        arg_clean = args_str.strip()
+        if not arg_clean:
+            native = await _probe_native_agy_command(drv, "/plugin list", ws, active_engine)
             res = await _run_subcmd_with_args(drv, "plugin", "list", ws, active_engine)
+            body = res["reply"]
+            if native and str(native.get("response") or "").strip():
+                body = f"【⚙️ {active_engine.upper()} · `plugin list`】\n{_clip(str(native['response']).strip())}"
             session_repo.set_pending_interaction(user_id, {"command": "plugin"})
             return _outcome(
-                res["reply"] + "\n\n👉 请直接回复 `plugin` 子命令参数（如 `list`、`enable <名>`、`disable <名>`、`install <源>`、`uninstall <名>`，回复 `/cancel` 取消）。",
+                body + "\n\n👉 请直接回复 `plugin` 子命令参数（如 `list`、`enable <名>`、`disable <名>`、`install <源>`、`uninstall <名>`，`help`，回复 `/cancel` 取消）。",
                 tier=f"T0_ENGINE_INTERACT:{active_engine}:plugin",
                 active_engine=active_engine,
                 ws=ws,
+                keep_pending=True,
             )
-        return await _run_subcmd_with_args(drv, "plugin", args_str, ws, active_engine)
+        if arg_clean.lower() == "list":
+            native = await _probe_native_agy_command(drv, "/plugin list", ws, active_engine)
+            if native and str(native.get("response") or "").strip():
+                return _outcome(
+                    f"【⚙️ {active_engine.upper()} · `plugin list`】\n{_clip(str(native['response']).strip())}",
+                    tier=f"T0_ENGINE_SUBCMD:{active_engine}:plugin",
+                    active_engine=active_engine,
+                    ws=ws,
+                )
+        return await _run_subcmd_with_args(drv, "plugin", arg_clean, ws, active_engine)
 
     if cmd_name == "remote-control":
         arg = args_str.strip()
@@ -1041,25 +1571,76 @@ async def dispatch_internal_engine_command(
                 tier=f"T0_ENGINE_INTERACT:{active_engine}:remote-control",
                 active_engine=active_engine,
                 ws=ws,
+                keep_pending=True,
             )
-        if arg.isdigit() and 1 <= int(arg) <= len(REMOTE_CONTROL_OPTIONS):
-            arg = REMOTE_CONTROL_OPTIONS[int(arg) - 1]
+        if arg.isdigit():
+            idx = int(arg) - 1
+            if 0 <= idx < len(REMOTE_CONTROL_OPTIONS):
+                arg = REMOTE_CONTROL_OPTIONS[idx]
+            else:
+                return _outcome(
+                    f"⛔ 无效序号 `{arg}`，可选：`1. status` | `2. start` | `3. stop`" + ("（回复 `/cancel` 取消）" if from_pending else ""),
+                    tier=f"T0_ENGINE_CMD:{active_engine}:remote-control",
+                    active_engine=active_engine,
+                    ws=ws,
+                    keep_pending=from_pending,
+                )
         return await _run_subcmd_with_args(drv, "remote-control", arg, ws, active_engine)
 
     if cmd_name == "changelog":
         return await _run_subcmd_with_args(drv, "changelog", args_str, ws, active_engine)
 
     if cmd_name in ("install", "update"):
-        eff = args_str.strip() or "--help"
-        return await _run_subcmd_with_args(drv, cmd_name, eff, ws, active_engine)
+        arg = args_str.strip()
+        low = arg.lower()
+        if not arg:
+            resolved = resolve_binary(getattr(drv, "binary_path", "")) if drv else None
+            ver = await drv.probe_version(ws) if (drv and resolved) else "未知"
+            session_repo.set_pending_interaction(user_id, {"command": cmd_name})
+            extra_hint = "（或附加参数如 `--dir ~/.local/bin`）" if cmd_name == "install" else ""
+            return _outcome(
+                f"【⚙️ {active_engine.upper()} · /{cmd_name}】（当前版本：`{ver}`）\n"
+                f"• 该命令会修改宿主环境/CLI 二进制。\n"
+                f"👉 如确认在宿主执行 `{cmd_name}`，请回复 `confirm`{extra_hint}（回复 `/cancel` 取消）。",
+                tier=f"T0_ENGINE_INTERACT:{active_engine}:{cmd_name}",
+                active_engine=active_engine,
+                ws=ws,
+                keep_pending=True,
+            )
+        if cmd_name == "update" and low in ("--help", "-h", "help"):
+            return _outcome(
+                f"【⚙️ {active_engine.upper()} · /update】\n• 用法：`/update`（交互确认）或 `/update confirm`（直接执行宿主 CLI 升级检查）。",
+                tier=f"T0_ENGINE_CMD:{active_engine}:update",
+                active_engine=active_engine,
+                ws=ws,
+            )
+        eff = "" if low in ("confirm", "yes", "y", "确认") else arg
+        return await _run_subcmd_with_args(drv, cmd_name, eff, ws, active_engine, timeout=30.0)
 
     if cmd_name in ("acp", "mic-serve"):
         return await _run_subcmd_with_args(drv, cmd_name, "--help", ws, active_engine)
 
     if cmd_name in ("usage", "credits"):
-        return await _handle_usage_cmd(active_engine, ws, meta, drv)
+        return await _handle_usage_cmd(cmd_name, active_engine, ws, meta, drv)
 
     if cmd_name == "skills":
+        native = await _probe_native_agy_command(drv, "/skills", ws, active_engine)
+        if native and str(native.get("response") or "").strip():
+            rows = []
+            for ln in str(native["response"]).splitlines():
+                if not ln.strip():
+                    continue
+                parts = ln.split("\t", 1)
+                sname = parts[0].strip()
+                sdesc = parts[1].strip()[:72] if len(parts) > 1 else ""
+                rows.append(f"• `/{sname}`" + (f" — {sdesc}" if sdesc else ""))
+            if rows:
+                return _outcome(
+                    _clip(f"【🧩 {active_engine.upper()} · 已发现技能 (Skills)】\n" + "\n".join(rows)),
+                    tier=f"T0_ENGINE_CMD:{active_engine}:skills",
+                    active_engine=active_engine,
+                    ws=ws,
+                )
         skills = await asyncio.to_thread(_scan_skills, ws)
         body = "\n".join(f"• `/{name}` ({scope})" for name, scope in skills) if skills else "（未扫描到自定义 Skill）"
         return _outcome(f"【🧩 {active_engine.upper()} · 已发现技能 (Skills)】\n{body}", tier=f"T0_ENGINE_CMD:{active_engine}:skills", active_engine=active_engine, ws=ws)
@@ -1074,14 +1655,27 @@ async def dispatch_internal_engine_command(
             )
         if "=" in arg:
             k, v = [p.strip() for p in arg.split("=", 1)]
-            if k in ("model", "mode", "effort", "agent", "sandbox"):
+            k_low = k.lower()
+            if k_low in ("model", "mode", "effort", "agent", "sandbox", "project"):
                 return await dispatch_internal_engine_command(
-                    k, v,
+                    k_low, v,
                     user_id=user_id, active_engine=active_engine, ws=ws, meta=meta, drv=drv,
                     store=store, session_repo=session_repo, workspace_nav=workspace_nav,
                 )
+        if from_pending and arg:
+            return _outcome(
+                f"⛔ 无法识别的配置项 `{arg}`。请回复 `1-7` 或 `model=xxx`（回复 `/cancel` 取消）。",
+                tier=f"T0_ENGINE_INTERACT:{active_engine}:config",
+                active_engine=active_engine,
+                ws=ws,
+                keep_pending=True,
+            )
         cfg = meta.get("config") or {}
-        settings_txt = await asyncio.to_thread(_read_settings_summary, ws)
+        native = await _probe_native_agy_command(drv, "/config", ws, active_engine)
+        if native and str(native.get("response") or "").strip():
+            settings_txt = f"• 宿主生效配置摘要：\n```\n{_clip(str(native['response']).strip(), 900)}\n```"
+        else:
+            settings_txt = await asyncio.to_thread(_read_settings_summary, ws)
         session_repo.set_pending_interaction(user_id, {"command": "config"})
         lines = [
             f"【⚙️ {active_engine.upper()} · 当前会话配置】",
@@ -1091,19 +1685,32 @@ async def dispatch_internal_engine_command(
             f"4. agent: `{cfg.get('agent') or '默认'}`",
             f"5. sandbox: `{'开启' if cfg.get('sandbox') else '关闭'}`",
             f"6. add-dir: `{cfg.get('add_dirs') or '无'}`",
+            f"7. project: `{cfg.get('project') or '默认'}`",
             "",
             settings_txt,
             "",
-            "👉 回复【序号 `1-6`】进入对应交互配置，或回复 `model=xxx`（回复 `/cancel` 取消）。",
+            "👉 回复【序号 `1-7`】进入对应交互配置，或回复 `model=xxx`（回复 `/cancel` 取消）。",
         ]
-        return _outcome("\n".join(lines), tier=f"T0_ENGINE_INTERACT:{active_engine}:config", active_engine=active_engine, ws=ws)
+        return _outcome(
+            "\n".join(lines),
+            tier=f"T0_ENGINE_INTERACT:{active_engine}:config",
+            active_engine=active_engine,
+            ws=ws,
+            keep_pending=True,
+        )
 
     if cmd_name in ("hooks", "permissions"):
+        native = await _probe_native_agy_command(drv, f"/{cmd_name}", ws, active_engine)
+        native_line = ""
+        if native:
+            cmd_data = _mask_secrets((native.get("command") or {}).get("data"))
+            if cmd_data:
+                native_line = f"• 原生 {active_engine.upper()} 状态：\n```json\n{_clip(json.dumps(cmd_data, ensure_ascii=False, indent=2), 700)}\n```\n"
         settings_txt = await asyncio.to_thread(_read_settings_summary, ws)
         return _outcome(
             f"【🛡️ {active_engine.upper()} · /{cmd_name}】\n"
             f"• 权限跳过标志：`{getattr(drv, 'skip_flag', '') or '未启用'}`\n"
-            f"{settings_txt}",
+            f"{native_line}{settings_txt}",
             tier=f"T0_ENGINE_CMD:{active_engine}:{cmd_name}",
             active_engine=active_engine,
             ws=ws,
@@ -1144,15 +1751,31 @@ async def dispatch_internal_engine_command(
         return await _handle_diff_cmd(args_str, active_engine, ws)
 
     if cmd_name == "open":
-        return await _handle_open_cmd(user_id, args_str, active_engine, ws, session_repo, cached_files=ctx.get("files"))
+        return await _handle_open_cmd(
+            user_id, args_str, active_engine, ws, session_repo, cached_files=ctx.get("files"), from_pending=from_pending
+        )
 
     if cmd_name == "codesearch":
         return await _handle_codesearch_cmd(user_id, args_str, active_engine, ws, session_repo)
 
-    if cmd_name in ("context", "statusline"):
+    if cmd_name == "statusline":
+        cfg = meta.get("config") or {}
+        cid = str(meta.get("conversation_id") or "")
+        cid_short = f"{cid[:12]}..." if len(cid) > 12 else (cid or "未创建")
+        return _outcome(
+            f"【📟 {active_engine.upper()} · Statusline】\n"
+            f"`[{active_engine.upper()}]` `{Path(ws).name}` | mode=`{cfg.get('mode') or 'default'}` | "
+            f"model=`{cfg.get('model') or 'default'}` | effort=`{cfg.get('effort') or 'default'}` | "
+            f"thread=`{cid_short}` | turns={int(meta.get('turn_count') or 0)}",
+            tier=f"T0_ENGINE_CMD:{active_engine}:statusline",
+            active_engine=active_engine,
+            ws=ws,
+        )
+
+    if cmd_name == "context":
         cfg = meta.get("config") or {}
         since_ts = float(meta.get("session_started_at") or 0.0)
-        exchanges = await asyncio.to_thread(session_repo.get_session_exchanges, user_id, active_engine, since_ts, 50)
+        exchanges = await asyncio.to_thread(session_repo.get_session_exchanges, user_id, active_engine, since_ts, 50, True)
         total_chars = sum(len(x["prompt"]) + len(x["reply"]) for x in exchanges)
         return _outcome(
             "\n".join([
@@ -1160,32 +1783,26 @@ async def dispatch_internal_engine_command(
                 f"• 工作区：`{ws}`",
                 f"• 附加目录 (`--add-dir`)：{cfg.get('add_dirs') or '无'}",
                 f"• 会话标题：{meta.get('title') or '未命名'} | Thread ID：`{meta.get('conversation_id') or '尚未创建'}`",
-                f"• 生效参数：model={cfg.get('model') or '默认'}, mode={cfg.get('mode') or '默认'}, effort={cfg.get('effort') or '默认'}, agent={cfg.get('agent') or '默认'}, sandbox={'开' if cfg.get('sandbox') else '关'}",
-                f"• 会话统计：turn_count={int(meta.get('turn_count') or 0)} | 近期消息={len(exchanges)} 条 ({total_chars} chars)",
+                f"• 生效参数：model={cfg.get('model') or '默认'}, mode={cfg.get('mode') or '默认'}, effort={cfg.get('effort') or '默认'}, agent={cfg.get('agent') or '默认'}, project={cfg.get('project') or '默认'}, sandbox={'开' if cfg.get('sandbox') else '关'}",
+                f"• 会话统计：turn_count={int(meta.get('turn_count') or 0)} | AI 轮次={len(exchanges)} 条 ({total_chars} chars)",
             ]),
-            tier=f"T0_ENGINE_CMD:{active_engine}:{cmd_name}",
+            tier=f"T0_ENGINE_CMD:{active_engine}:context",
             active_engine=active_engine,
             ws=ws,
         )
 
     if cmd_name == "copy":
-        since_ts = float(meta.get("session_started_at") or 0.0)
-        exchanges = await asyncio.to_thread(session_repo.get_session_exchanges, user_id, active_engine, since_ts, 5)
-        for ex in reversed(exchanges):
-            if ex["reply"].strip():
-                return _outcome(
-                    f"📋 最近一条回复原文（长按即可复制）：\n\n{ex['reply']}",
-                    tier=f"T0_ENGINE_CMD:{active_engine}:copy",
-                    active_engine=active_engine,
-                    ws=ws,
-                )
-        return _outcome("ℹ️ 当前会话暂无可复制的最近一条 AI 回复。", tier=f"T0_ENGINE_CMD:{active_engine}:copy", active_engine=active_engine, ws=ws)
+        return await _handle_copy_cmd(user_id, args_str, active_engine, ws, meta, session_repo, from_pending=from_pending)
 
     if cmd_name == "artifact":
-        return await _handle_artifact_cmd(user_id, args_str, active_engine, ws, meta, session_repo, cached_files=ctx.get("files"))
+        return await _handle_artifact_cmd(
+            user_id, args_str, active_engine, ws, meta, session_repo, cached_files=ctx.get("files"), from_pending=from_pending
+        )
 
     if cmd_name == "projects":
-        return await _handle_projects_cmd(user_id, args_str, active_engine, ws, session_repo, workspace_nav, cached_projects=ctx.get("projects"))
+        return await _handle_projects_cmd(
+            user_id, args_str, active_engine, ws, meta, session_repo, workspace_nav, cached_projects=ctx.get("projects"), from_pending=from_pending
+        )
 
     if cmd_name == "tasks":
         cid = str(meta.get("conversation_id") or "").strip()
@@ -1209,6 +1826,7 @@ async def dispatch_internal_engine_command(
                 tier=f"T0_ENGINE_INTERACT:{active_engine}:feedback",
                 active_engine=active_engine,
                 ws=ws,
+                keep_pending=True,
             )
         fb_dir = Path(ws).resolve() / ".wechat_audit"
         fb_file = fb_dir / "feedback.jsonl"

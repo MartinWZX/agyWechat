@@ -8,6 +8,47 @@ from typing import Any, Dict, List, Optional
 from memory.core_state_store import CoreStateStore
 
 
+_INTERNAL_CONTROL_COMMANDS = frozenset({
+    "exit", "quit", "clear", "help", "cancel",
+    "resume", "conversation", "new", "fork", "branch", "rename", "title", "rewind", "undo", "btw",
+    "models", "model", "mode", "effort", "agents", "agent", "add-dir", "sandbox", "project",
+    "mcp", "plugin", "plugins", "remote-control", "changelog", "install", "update",
+    "usage", "quota", "credits", "skills", "hooks", "permissions", "config", "settings",
+    "memory", "doctor", "acp", "mic-serve",
+    "diff", "open", "codesearch", "cs", "context", "copy", "artifact", "projects",
+    "tasks", "feedback", "statusline", "keybindings", "voice", "record", "logout",
+})
+
+_INTERNAL_REPLY_PREFIXES = (
+    "【",
+    "✅ [",
+    "✅ 已",
+    "✅ 反馈已记录",
+    "⛔ ",
+    "⚠️ [AGY] 子命令",
+    "⚠️ [PI] 子命令",
+    "⚠️ [CLAUDE] 子命令",
+    "⚠️ [OMP] 子命令",
+    "⚠️ 当前未找到",
+    "⚠️ 未找到",
+    "⚠️ 文件不存在",
+    "⚠️ 暂无",
+    "ℹ️ ",
+    "🆕 ",
+    "🌿 ",
+    "⏪ ",
+    "📄 `",
+    "🔍 `",
+    "🔍 未在",
+    "📋 最近一条回复原文",
+    "📋 最近一次 `/btw`",
+    "📋 第 ",
+    "🎙️ 微信端",
+    "⌨️ 终端快捷键",
+    "🔐 为避免",
+)
+
+
 class EngineSessionRepository:
     """Minimal persistence layer for Two-State Engine FSM (`working_sessions` table)."""
 
@@ -401,34 +442,99 @@ class EngineSessionRepository:
                 conn.commit()
         return meta
 
+    def set_last_btw_reply(self, user_id: str, reply: str) -> None:
+        """Persist latest /btw answer in session metadata without mutating main conversation_id."""
+        clean = (reply or "").strip()
+        if not clean:
+            return
+        sid = self._session_id(user_id)
+        now = time.time()
+        with self._lock:
+            with self.store._get_connection() as conn:
+                c = conn.cursor()
+                c.execute("SELECT engine_meta_json FROM working_sessions WHERE session_id = ?;", (sid,))
+                row = c.fetchone()
+                meta = self._safe_json_dict(row["engine_meta_json"] if row else None)
+                meta["last_btw_reply"] = clean
+                conn.execute(
+                    "UPDATE working_sessions SET updated_at = ?, engine_meta_json = ? WHERE session_id = ?;",
+                    (now, json.dumps(meta, ensure_ascii=False), sid),
+                )
+                conn.commit()
+
     def get_session_exchanges(
         self,
         user_id: str,
         active_engine: str,
         since_ts: float = 0.0,
         limit: int = 20,
+        only_ai_turns: bool = True,
     ) -> List[Dict[str, Any]]:
         """Return recent message turns recorded for this user and active engine."""
         with self.store._get_connection() as conn:
             c = conn.cursor()
+            fetch_limit = max(int(limit) * 6, 120) if only_ai_turns else int(limit)
             c.execute(
                 "SELECT msg_id, normalized_content, reply_content, created_at "
                 "FROM messages "
                 "WHERE user_id = ? AND LOWER(engine_used) = LOWER(?) AND created_at >= ? "
-                "AND normalized_content NOT IN ('/exit', '/clear', '/help') "
+                "AND normalized_content NOT IN ('/exit', '/quit', '/clear', '/help') "
                 "ORDER BY created_at DESC LIMIT ?;",
-                (user_id, active_engine, float(since_ts or 0.0), int(limit)),
+                (user_id, active_engine, float(since_ts or 0.0), fetch_limit),
             )
-            rows = c.fetchall()
-        return [
-            {
+            rows = list(reversed(c.fetchall()))
+
+        if not only_ai_turns:
+            return [
+                {
+                    "msg_id": r["msg_id"],
+                    "prompt": str(r["normalized_content"] or ""),
+                    "reply": str(r["reply_content"] or ""),
+                    "created_at": float(r["created_at"] or 0.0),
+                }
+                for r in rows[-int(limit):]
+            ]
+
+        filtered: List[Dict[str, Any]] = []
+        pending_interactive = False
+        pending_btw_prompt = False
+        for r in rows:
+            prompt = str(r["normalized_content"] or "").strip()
+            reply = str(r["reply_content"] or "").strip()
+            low = prompt.lower()
+            cmd_tok = prompt.split(None, 1)[0][1:].lower() if prompt.startswith("/") else ""
+            asks_followup = ("`/cancel` 取消" in reply) or ("/cancel 取消" in reply) or ("请重新" in reply and "取消" in reply)
+
+            if cmd_tok == "btw":
+                pending_interactive = False
+                if len(prompt.split(None, 1)) == 1:
+                    pending_btw_prompt = True
+                continue
+            if low in ("cancel", "取消", "/cancel"):
+                pending_btw_prompt = False
+                pending_interactive = False
+                continue
+            if pending_btw_prompt and not prompt.startswith("/"):
+                pending_btw_prompt = False
+                pending_interactive = False
+                continue
+            if cmd_tok in _INTERNAL_CONTROL_COMMANDS:
+                pending_btw_prompt = False
+                pending_interactive = asks_followup
+                continue
+            if pending_interactive:
+                pending_interactive = asks_followup
+                continue
+            if reply.startswith(_INTERNAL_REPLY_PREFIXES):
+                pending_interactive = asks_followup
+                continue
+            filtered.append({
                 "msg_id": r["msg_id"],
-                "prompt": str(r["normalized_content"] or ""),
-                "reply": str(r["reply_content"] or ""),
+                "prompt": prompt,
+                "reply": reply,
                 "created_at": float(r["created_at"] or 0.0),
-            }
-            for r in reversed(rows)
-        ]
+            })
+        return filtered[-int(limit):]
 
     def rewind_session_turns(self, user_id: str, remove_count: int = 1) -> Dict[str, Any]:
         """Remove the last `remove_count` message turns from session log and adjust turn_count."""
@@ -446,15 +552,12 @@ class EngineSessionRepository:
                 active_eng = str(row["active_engine"] or "").strip().lower() if row else ""
                 meta = self._safe_json_dict(row["engine_meta_json"] if row else None)
                 since_ts = float(meta.get("session_started_at") or 0.0)
-                c.execute(
-                    "SELECT msg_id, normalized_content FROM messages "
-                    "WHERE user_id = ? AND LOWER(engine_used) = LOWER(?) AND created_at >= ? "
-                    "AND normalized_content NOT IN ('/exit', '/clear', '/help') "
-                    "ORDER BY created_at DESC LIMIT ?;",
-                    (user_id, active_eng, since_ts, n),
-                )
-                targets = c.fetchall()
-                removed_ids = [r["msg_id"] for r in targets]
+            ai_exchanges = self.get_session_exchanges(
+                user_id, active_eng, since_ts=since_ts, limit=max(n, 50), only_ai_turns=True
+            )
+            targets = ai_exchanges[-n:]
+            removed_ids = [item["msg_id"] for item in targets]
+            with self.store._get_connection() as conn:
                 for mid in removed_ids:
                     conn.execute("DELETE FROM messages WHERE msg_id = ?;", (mid,))
                 cur_turns = int(meta.get("turn_count") or 0)
