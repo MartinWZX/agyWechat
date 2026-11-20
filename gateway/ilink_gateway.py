@@ -271,6 +271,7 @@ class ILinkGatewayWorker:
         text_parts = []
         has_voice = False
         has_text = False
+        media_meta: Optional[Dict[str, Any]] = None
         for item in msg.get("item_list") or []:
             if item.get("type") == 1 and "text_item" in item:
                 txt = str(item["text_item"].get("text", ""))
@@ -284,29 +285,68 @@ class ILinkGatewayWorker:
                     text_parts.append(vtxt)
             elif item.get("type") == 3:
                 has_voice = True
+            elif "image_item" in item or item.get("type") == 2:
+                img = item.get("image_item") if isinstance(item.get("image_item"), dict) else {}
+                media_meta = {
+                    "asset_type": "image",
+                    "url": str(img.get("url") or img.get("pic_url") or img.get("aes_url") or ""),
+                    "base64": str(img.get("base64") or img.get("data") or ""),
+                    "file_name": str(img.get("file_name") or img.get("name") or img.get("media_id") or ""),
+                }
+            elif "file_item" in item or item.get("type") == 4:
+                fobj = item.get("file_item") if isinstance(item.get("file_item"), dict) else {}
+                media_meta = {
+                    "asset_type": "file",
+                    "file_name": str(fobj.get("file_name") or fobj.get("name") or fobj.get("title") or ""),
+                    "content": str(fobj.get("content") or fobj.get("text") or ""),
+                    "base64": str(fobj.get("base64") or fobj.get("data") or ""),
+                    "url": str(fobj.get("url") or fobj.get("file_url") or ""),
+                }
+
         text_content = "".join(text_parts).strip()
-        if not text_content and not has_voice:
+        if not text_content and not has_voice and not media_meta:
             return
 
         if not self.is_authorized(from_user):
             await self.pusher.send_raw(from_user, "⛔ 权限受限：您不在当前 WeChat-AGY Bridge 的白名单内。")
             return
 
-        inferred_type = "voice" if (has_voice and not has_text) else "text"
+        if media_meta is not None:
+            inferred_type = media_meta["asset_type"]
+            if text_content:
+                media_meta["caption"] = text_content
+        elif has_voice and not has_text:
+            inferred_type = "voice"
+        else:
+            inferred_type = "text"
+
+        async def _push_progress(progress_msg: str) -> None:
+            await self.pusher.send_raw(from_user, progress_msg)
+
         try:
             if hasattr(self.router, "route"):
                 route_fn = self.router.route
-                if inferred_type == "voice" and "msg_type" in inspect.signature(route_fn).parameters:
-                    result = await route_fn(from_user, text_content, msg_type="voice")
-                else:
-                    result = await route_fn(from_user, text_content)
+                sig_params = inspect.signature(route_fn).parameters
+                kw: Dict[str, Any] = {}
+                if inferred_type != "text" and "msg_type" in sig_params:
+                    kw["msg_type"] = inferred_type
+                if "progress_callback" in sig_params:
+                    kw["progress_callback"] = _push_progress
+                if media_meta is not None and "media_meta" in sig_params:
+                    kw["media_meta"] = media_meta
+                result = await route_fn(from_user, text_content, **kw)
                 reply = result.reply if hasattr(result, "reply") else str(result or "")
             elif hasattr(self.router, "process_inbound_message"):
                 proc_fn = self.router.process_inbound_message
-                if inferred_type == "voice" and "msg_type" in inspect.signature(proc_fn).parameters:
-                    reply = await proc_fn(from_user, text_content, msg_type="voice")
-                else:
-                    reply = await proc_fn(from_user, text_content)
+                sig_params = inspect.signature(proc_fn).parameters
+                kw = {}
+                if inferred_type != "text" and "msg_type" in sig_params:
+                    kw["msg_type"] = inferred_type
+                if "progress_callback" in sig_params:
+                    kw["progress_callback"] = _push_progress
+                if media_meta is not None and "media_meta" in sig_params:
+                    kw["media_meta"] = media_meta
+                reply = await proc_fn(from_user, text_content, **kw)
             else:
                 reply = "Router does not implement route or process_inbound_message."
             if reply:

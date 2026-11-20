@@ -3,6 +3,8 @@ system:
   app_name: "agyWechat"
   workspace_dir: "."
   db_path: "memory/agent_core.db"
+  progress_push_interval_seconds: 0
+  user_workspaces: {}
 
 engines:
   primary: "agy"

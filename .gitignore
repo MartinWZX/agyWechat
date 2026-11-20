@@ -135,6 +135,8 @@ Thumbs.db
 # ==========================================
 .context_tokens.json
 .context_tokens.sync_buf
+.wechat_assets/
+.wechat_audit/
 wechat_qr.png
 QR.png
 qr_*.png

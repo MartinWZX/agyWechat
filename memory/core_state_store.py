@@ -1,9 +1,10 @@
 """SQLite WAL Mode Core State Store for Working Sessions and Message History."""
+import json
 import os
 import sqlite3
 import time
 from pathlib import Path
-from typing import Any, Dict, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from memory.sqlite_utils import connect as sqlite_connect
 
@@ -191,6 +192,131 @@ class CoreStateStore:
             "voice_messages": voice_msgs,
             "engine_message_counts": eng_counts,
         }
+
+    def export_engine_audit(
+        self,
+        engine_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+        limit: int = 100,
+    ) -> Dict[str, Any]:
+        """Aggregate fine-grained per-engine command audit metrics and recent execution records."""
+        target_engine = (engine_id or "").strip().lower() or None
+        valid_engines = ("agy", "pi", "claude", "omp")
+        if target_engine and target_engine not in valid_engines:
+            raise ValueError(f"Unsupported engine '{target_engine}'")
+
+        engines_scope = (target_engine,) if target_engine else valid_engines
+        effective_limit = max(1, min(int(limit), 1000))
+
+        with self._get_connection() as conn:
+            c = conn.cursor()
+            engine_summaries: Dict[str, Dict[str, Any]] = {}
+            for eid in engines_scope:
+                where_parts = ["LOWER(engine_used) = ?"]
+                params: List[Any] = [eid]
+                if user_id:
+                    where_parts.append("user_id = ?")
+                    params.append(user_id)
+                where_sql = " AND ".join(where_parts)
+                c.execute(
+                    f"SELECT "
+                    f"COUNT(*) AS total_calls, "
+                    f"COALESCE(SUM(CASE WHEN is_voice = 1 THEN 1 ELSE 0 END), 0) AS voice_calls, "
+                    f"COALESCE(SUM(CASE WHEN is_voice = 0 THEN 1 ELSE 0 END), 0) AS text_calls, "
+                    f"COALESCE(SUM(CASE WHEN LTRIM(normalized_content) LIKE '/%' THEN 1 ELSE 0 END), 0) AS slash_calls, "
+                    f"COUNT(DISTINCT user_id) AS unique_users, "
+                    f"MAX(created_at) AS last_active_at "
+                    f"FROM messages WHERE {where_sql};",
+                    tuple(params),
+                )
+                agg = c.fetchone()
+                engine_summaries[eid] = {
+                    "total_calls": int(agg["total_calls"] or 0),
+                    "voice_calls": int(agg["voice_calls"] or 0),
+                    "text_calls": int(agg["text_calls"] or 0),
+                    "slash_calls": int(agg["slash_calls"] or 0),
+                    "unique_users": int(agg["unique_users"] or 0),
+                    "last_active_at": agg["last_active_at"],
+                }
+
+            rec_where = [
+                "LOWER(engine_used) = ?"
+                if target_engine
+                else "LOWER(engine_used) IN ('agy', 'pi', 'claude', 'omp')"
+            ]
+            rec_params: List[Any] = [target_engine] if target_engine else []
+            if user_id:
+                rec_where.append("user_id = ?")
+                rec_params.append(user_id)
+            rec_params.append(effective_limit)
+
+            c.execute(
+                f"SELECT msg_id, session_id, user_id, msg_type, normalized_content, is_voice, "
+                f"reply_content, engine_used, created_at "
+                f"FROM messages WHERE {' AND '.join(rec_where)} "
+                f"ORDER BY created_at DESC LIMIT ?;",
+                tuple(rec_params),
+            )
+            records = []
+            for r in c.fetchall():
+                cmd_text = str(r["normalized_content"] or "")
+                reply_text = str(r["reply_content"] or "")
+                records.append({
+                    "msg_id": r["msg_id"],
+                    "session_id": r["session_id"],
+                    "user_id": r["user_id"],
+                    "engine_used": str(r["engine_used"] or "").lower(),
+                    "msg_type": r["msg_type"],
+                    "is_voice": bool(r["is_voice"]),
+                    "command": cmd_text,
+                    "is_slash_command": cmd_text.lstrip().startswith("/"),
+                    "reply_length": len(reply_text),
+                    "reply_preview": reply_text[:200],
+                    "created_at": r["created_at"],
+                })
+
+            sess_sql = "SELECT user_id, active_engine, workspace_dir, updated_at FROM working_sessions"
+            sess_params: List[Any] = []
+            if user_id:
+                sess_sql += " WHERE user_id = ?"
+                sess_params.append(user_id)
+            sess_sql += " ORDER BY updated_at DESC;"
+            c.execute(sess_sql, tuple(sess_params))
+            active_sessions = [
+                {
+                    "user_id": s["user_id"],
+                    "active_engine": s["active_engine"] or "",
+                    "workspace_dir": s["workspace_dir"] or "",
+                    "updated_at": s["updated_at"],
+                }
+                for s in c.fetchall()
+            ]
+
+        return {
+            "generated_at": time.time(),
+            "filter_engine": target_engine or "all",
+            "filter_user": user_id or "all",
+            "engine_summaries": engine_summaries,
+            "active_sessions": active_sessions,
+            "record_count": len(records),
+            "records": records,
+        }
+
+    def export_engine_audit_to_file(
+        self,
+        workspace_dir: Union[str, Path],
+        engine_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+        limit: int = 100,
+    ) -> Tuple[Path, Dict[str, Any]]:
+        """Persist fine-grained per-engine command audit JSON into `<workspace_dir>/.wechat_audit/`."""
+        audit = self.export_engine_audit(engine_id=engine_id, user_id=user_id, limit=limit)
+        audit_dir = Path(workspace_dir).resolve() / ".wechat_audit"
+        audit_dir.mkdir(parents=True, exist_ok=True)
+        tag = (engine_id or "all").strip().lower() or "all"
+        out_path = audit_dir / f"engine_audit_{tag}.json"
+        out_path.write_text(json.dumps(audit, ensure_ascii=False, indent=2), encoding="utf-8")
+        return out_path, audit
 
     def close(self) -> bool:
         """Flush SQLite WAL frames into the main database file."""

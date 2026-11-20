@@ -1,11 +1,12 @@
 """Pure Two-State Engine Session FSM Router."""
+import asyncio
 from dataclasses import dataclass, field
 import logging
 from pathlib import Path
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
-from config import resolve_workspace_root
+from config import resolve_user_workspaces, resolve_workspace_root
 from memory.core_state_store import CoreStateStore
 from memory.engine_session_repository import EngineSessionRepository
 from router.engine_session_presenter import (
@@ -71,10 +72,12 @@ class EngineSessionRouter:
         self.health_monitor = health_monitor
         sys_cfg = (config or {}).get("system") or {}
         default_ws = _resolve_default_workspace(hub=hub, config=config, settings=settings)
+        user_ws_map = resolve_user_workspaces(settings=settings, yaml_config=config)
         self.workspace_nav = WorkspaceNavigator(
             self.session_repo,
             default_workspace=default_ws,
             allowed_roots=sys_cfg.get("allowed_workspace_roots"),
+            user_workspaces=user_ws_map,
         )
 
     def get_session_state(self, user_id: str) -> Dict[str, Any]:
@@ -178,6 +181,44 @@ class EngineSessionRouter:
             workspace_dir=ws,
         )
 
+    async def _handle_engine_audit_export(self, user_id: str, engine_arg: str) -> RouteDecision:
+        """Generate and export fine-grained per-engine command audit JSON for the user's workspace."""
+        target = engine_arg.strip().lower()
+        if target and target not in ("agy", "pi", "claude", "omp"):
+            return RouteDecision(
+                True,
+                "⛔ 无效引擎名称，可选值：agy、pi、claude、omp（留空则导出全部四引擎审计）。",
+                tier="T0_COMMAND",
+            )
+        norm_engine = target or None
+        ws = self.workspace_nav.get_workspace(user_id)
+        out_path, audit = await asyncio.to_thread(
+            self.store.export_engine_audit_to_file,
+            ws,
+            norm_engine,
+            user_id,
+            100,
+        )
+        lines = [f"📑 【每引擎指令审计报告 · {audit['filter_engine'].upper()}】"]
+        for eid, stats in audit["engine_summaries"].items():
+            lines.append(
+                f"• /{eid}: 总调用 {stats['total_calls']} 次 "
+                f"(文字 {stats['text_calls']} / 语音 {stats['voice_calls']} / 斜杠命令 {stats['slash_calls']})"
+            )
+        recent = audit["records"][:5]
+        if recent:
+            lines.append("")
+            lines.append(f"🕒 最近 {len(recent)} 条记录：")
+            for rec in recent:
+                cmd_preview = rec["command"].replace("\n", " ")[:48]
+                kind = "语音" if rec["is_voice"] else "文字"
+                lines.append(f"  - [{rec['engine_used'].upper()}·{kind}] {cmd_preview}")
+        else:
+            lines.append("\n（暂无已记录的引擎执行明细）")
+        lines.append("")
+        lines.append(f"💾 审计 JSON 已导出至：`{out_path}`")
+        return RouteDecision(True, "\n".join(lines), tier="T0_COMMAND", workspace_dir=ws)
+
     async def route_non_engine(self, user_id: str, text: str) -> RouteDecision:
         """Handle text-only routing and host/workspace inspection when outside all engines."""
         t = text.strip()
@@ -196,6 +237,12 @@ class EngineSessionRouter:
         if low == "/engines":
             summary = await self._format_engines_summary_async(user_id)
             return RouteDecision(True, summary, tier="T0_COMMAND", effective_query=t)
+
+        if low == "/engines audit" or low.startswith("/engines audit "):
+            return await self._handle_engine_audit_export(user_id, t[14:])
+
+        if low == "/export" or low.startswith("/export "):
+            return await self._handle_engine_audit_export(user_id, t[7:])
 
         view_hit, view_reply = self.match_non_engine_view_command(t, user_id=user_id)
         if view_hit:
@@ -219,6 +266,7 @@ class EngineSessionRouter:
             "• /help — 查看帮助与命令说明\n"
             "• /status — 查看宿主机实时硬件状态与已安装引擎\n"
             "• /engines — 查看四大引擎安装状态、版本与路径\n"
+            "• /export [引擎名] — 导出每引擎指令调用审计 JSON 至工作区\n"
             "• /pwd — 查看当前工作目录\n"
             "• /workspace <路径> — 校验并切换工作目录\n"
             "• /ls [子目录] — 列出当前工作目录文件\n"

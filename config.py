@@ -81,6 +81,14 @@ class Settings(BaseSettings):
         default=2000,
         description="Maximum characters per outbound WeChat message segment",
     )
+    PROGRESS_PUSH_INTERVAL_SECONDS: float = Field(
+        default=0.0,
+        description="Seconds between streaming intermediate CLI progress summary pushes (0 disables)",
+    )
+    USER_WORKSPACES: Dict[str, str] = Field(
+        default_factory=dict,
+        description="Optional per-user default workspace directory mapping (JSON object or user=path pairs)",
+    )
 
     # Service Bind
     SERVICE_HOST: str = Field(default="0.0.0.0", description="HTTP service host")
@@ -102,6 +110,44 @@ class Settings(BaseSettings):
     @classmethod
     def parse_admin_users(cls, v: Any) -> List[str]:
         return _parse_str_list(v, default=["admin_user"])
+
+    @field_validator("USER_WORKSPACES", mode="before")
+    @classmethod
+    def parse_user_workspaces(cls, v: Any) -> Dict[str, str]:
+        return _parse_str_dict(v)
+
+
+def _parse_str_dict(v: Any) -> Dict[str, str]:
+    if isinstance(v, dict):
+        return {
+            str(k).strip(): str(val).strip()
+            for k, val in v.items()
+            if str(k).strip() and str(val).strip()
+        }
+    if isinstance(v, str):
+        s = v.strip()
+        if not s:
+            return {}
+        if s.startswith("{") and s.endswith("}"):
+            try:
+                parsed = json.loads(s)
+                if isinstance(parsed, dict):
+                    return {
+                        str(k).strip(): str(val).strip()
+                        for k, val in parsed.items()
+                        if str(k).strip() and str(val).strip()
+                    }
+            except ValueError:
+                pass
+        result: Dict[str, str] = {}
+        for part in s.split(","):
+            if "=" in part:
+                k, val = part.split("=", 1)
+                k, val = k.strip(), val.strip()
+                if k and val:
+                    result[k] = val
+        return result
+    return {}
 
 
 def _parse_str_list(v: Any, default: List[str]) -> List[str]:
@@ -147,6 +193,30 @@ def resolve_workspace_root(settings: Optional[Any] = None, yaml_config: Optional
     sys_cfg = (yaml_config or {}).get("system", {})
     raw = resolve_setting_or_yaml(settings, "WORKSPACE_ROOT", sys_cfg.get("workspace_dir"), str(Path.cwd().resolve()))
     return str(Path(str(raw)).expanduser().resolve())
+
+
+def resolve_user_workspaces(
+    settings: Optional[Any] = None, yaml_config: Optional[Dict[str, Any]] = None
+) -> Dict[str, str]:
+    """Merge per-user default workspace mappings with precedence: Settings.USER_WORKSPACES > config.yaml."""
+    merged: Dict[str, str] = {}
+    sys_cfg = (yaml_config or {}).get("system", {})
+    yaml_map = sys_cfg.get("user_workspaces") if isinstance(sys_cfg, dict) else None
+    if isinstance(yaml_map, dict):
+        for uid, path_val in yaml_map.items():
+            u = str(uid).strip()
+            p = str(path_val).strip()
+            if u and p:
+                merged[u] = p
+    if settings is not None and hasattr(settings, "USER_WORKSPACES"):
+        env_map = getattr(settings, "USER_WORKSPACES")
+        if isinstance(env_map, dict):
+            for uid, path_val in env_map.items():
+                u = str(uid).strip()
+                p = str(path_val).strip()
+                if u and p:
+                    merged[u] = p
+    return merged
 
 
 def get_engine_binary(

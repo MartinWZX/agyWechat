@@ -1,5 +1,6 @@
 """End-to-End Test Matrix for Lightweight Two-State Router, Four Engines, Native Voice Boundary & Webhook."""
 import asyncio
+import base64
 import json
 import os
 from pathlib import Path
@@ -547,5 +548,213 @@ async def test_webhook_xml_header_malformed_split_and_ansi_empty_fallback(
                 headers={"X-WeChat-Token": "wh_tok_edge"},
             )
             assert res_bad.status_code == 400
+    finally:
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_streaming_progress_summary_push_via_gateway_and_ilink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Verify long-running CLI emits periodic ANSI-cleaned intermediate stage summaries over time window."""
+    ws = tmp_path / "stream_ws"
+    ws.mkdir()
+    stream_bin = tmp_path / "mock_stream_agy.py"
+    _write_exec(
+        stream_bin,
+        "import json, sys, time\n"
+        "args = sys.argv[1:]\n"
+        "if '--version' in args: print('agy 1.8.0'); sys.exit(0)\n"
+        "print('\\x1b[33mStage 1: analyzing files\\x1b[0m', flush=True)\n"
+        "time.sleep(0.24)\n"
+        "print('Stage 2: running unit tests', flush=True)\n"
+        "time.sleep(0.24)\n"
+        "print(json.dumps({'conversation_id': 'c_stream_1', 'response': 'STREAM_FINAL_OK'}), flush=True)\n",
+    )
+
+    cfg = {
+        "system": {"workspace_dir": str(ws), "progress_push_interval_seconds": 0.12},
+        "engines": {"primary": "agy", "agy": {"binary": str(stream_bin), "dangerously_skip_permissions_flag": ""}},
+    }
+    s = Settings(
+        _env_file=None,
+        WORKSPACE_ROOT=ws,
+        DB_PATH=tmp_path / "stream.db",
+        ALLOWED_USERS=["wx_stream"],
+        WEIXIN_TOKEN="ilink_stream_tok",
+        PROGRESS_PUSH_INTERVAL_SECONDS=0.12,
+        AGY_BINARY=str(stream_bin),
+    )
+    store = CoreStateStore(s.DB_PATH)
+    hub = MultiCLIHub(config=cfg, store=store, settings=s)
+    gw = WeChatGateway(config=cfg, hub=hub, store=store, settings=s)
+
+    sent_msgs: List[str] = []
+
+    async def fake_send_message(*, token, to_user_id, text, context_token, base_url, client=None):
+        sent_msgs.append(text)
+        return {"ret": 0}
+
+    monkeypatch.setattr("gateway.ilink_gateway.ILinkAPIClient.send_message", fake_send_message)
+    worker = ILinkGatewayWorker(settings=s, router=gw, token_store=ContextTokenStore(tmp_path / "tok.json"))
+
+    try:
+        await worker._handle_message({
+            "from_user_id": "wx_stream",
+            "message_id": "m_enter_stream",
+            "context_token": "ctx_s1",
+            "item_list": [{"type": 1, "text_item": {"text": "/agy"}}],
+        })
+        sent_msgs.clear()
+
+        await worker._handle_message({
+            "from_user_id": "wx_stream",
+            "message_id": "m_run_stream",
+            "context_token": "ctx_s2",
+            "item_list": [{"type": 1, "text_item": {"text": "run slow check"}}],
+        })
+
+        progress_msgs = [m for m in sent_msgs if m.startswith("⏳ [AGY 运行中")]
+        assert len(progress_msgs) >= 2
+        assert all("\x1b" not in m for m in progress_msgs)
+        assert any("Stage 1" in m or "Stage 2" in m for m in progress_msgs)
+        assert sent_msgs[-1] == "STREAM_FINAL_OK"
+    finally:
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_inbound_image_file_persistence_and_audit_endpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Verify WeChat image/file auto-persistence in both states, path traversal safety, and /audit/engines."""
+    import main
+
+    ws = tmp_path / "asset_ws"
+    ws.mkdir()
+    prompt_log = tmp_path / "asset_prompts.log"
+    cli_bin = tmp_path / "mock_asset_agy.py"
+    _write_exec(
+        cli_bin,
+        "import json, sys\n"
+        f"LOG = {str(prompt_log)!r}\n"
+        "args = sys.argv[1:]\n"
+        "if '--version' in args: print('agy 1.8.0'); sys.exit(0)\n"
+        "p = args[args.index('-p') + 1] if '-p' in args else ''\n"
+        "with open(LOG, 'a', encoding='utf-8') as f: f.write(p + '\\n---\\n')\n"
+        "print(json.dumps({'conversation_id': 'c_asset', 'response': f'ANALYZED:{p.splitlines()[-1]}'}))\n",
+    )
+
+    cfg = {
+        "system": {"workspace_dir": str(ws)},
+        "engines": {"primary": "agy", "agy": {"binary": str(cli_bin), "dangerously_skip_permissions_flag": ""}},
+    }
+    s = Settings(
+        _env_file=None,
+        WORKSPACE_ROOT=ws,
+        DB_PATH=tmp_path / "asset.db",
+        ALLOWED_USERS=["wx_asset"],
+        WEIXIN_TOKEN="ilink_asset_tok",
+        WECHAT_TOKEN="wh_tok_asset",
+        WEBHOOK_REQUIRE_SIGNATURE=True,
+        AGY_BINARY=str(cli_bin),
+    )
+    store = CoreStateStore(s.DB_PATH)
+    hub = MultiCLIHub(config=cfg, store=store, settings=s)
+    mon = HealthMonitor(settings=s, store=store)
+    gw = WeChatGateway(config=cfg, hub=hub, store=store, health_monitor=mon, settings=s)
+
+    ilink_replies: List[str] = []
+
+    async def fake_send_message(*, token, to_user_id, text, context_token, base_url, client=None):
+        ilink_replies.append(text)
+        return {"ret": 0}
+
+    monkeypatch.setattr("gateway.ilink_gateway.ILinkAPIClient.send_message", fake_send_message)
+    worker = ILinkGatewayWorker(settings=s, router=gw, token_store=ContextTokenStore(tmp_path / "tok.json"))
+
+    monkeypatch.setattr(main, "settings", s)
+    monkeypatch.setattr(main, "store", store)
+    monkeypatch.setattr(main, "hub", hub)
+    monkeypatch.setattr(main, "monitor", mon)
+    monkeypatch.setattr(main, "gateway", gw)
+    monkeypatch.setattr(main, "ilink_worker", None)
+
+    png_bytes = b"\x89PNG\r\n\x1a\nfake_png_payload_123"
+    png_b64 = base64.b64encode(png_bytes).decode("ascii")
+
+    try:
+        # 1. Non-Engine state via iLink: image & file drop-off saves safely under .wechat_assets/ without triggering CLI
+        await worker._handle_message({
+            "from_user_id": "wx_asset",
+            "message_id": "asset_img_1",
+            "context_token": "ctx_a1",
+            "item_list": [{"type": 2, "image_item": {"base64": png_b64, "file_name": "../../evil.png"}}],
+        })
+        assert "已将微信图片自动落盘" in ilink_replies[-1]
+        saved_png = ws / ".wechat_assets" / "evil.png"
+        assert saved_png.is_file() and saved_png.read_bytes() == png_bytes
+        assert not (ws.parent / "evil.png").exists()
+        assert not prompt_log.exists()
+
+        await worker._handle_message({
+            "from_user_id": "wx_asset",
+            "message_id": "asset_file_1",
+            "context_token": "ctx_a2",
+            "item_list": [{"type": 4, "file_item": {"file_name": "helper.py", "content": "def ok():\n    return 1\n"}}],
+        })
+        assert "已将微信文件片段自动落盘" in ilink_replies[-1]
+        assert (ws / ".wechat_assets" / "helper.py").read_text(encoding="utf-8") == "def ok():\n    return 1\n"
+
+        # 2. Enter /agy, then send Webhook XML image + JSON file with captions -> persists AND forwards to CLI
+        assert "已进入 [AGY]" in await gw.process_inbound_message("wx_asset", "/agy")
+
+        with TestClient(main.app) as client:
+            xml_img = (
+                '<?xml version="1.0" encoding="UTF-8"?>'
+                "<xml><FromUserName><![CDATA[wx_asset]]></FromUserName>"
+                "<MsgId>wh_img_1</MsgId><MsgType><![CDATA[image]]></MsgType>"
+                "<FileName><![CDATA[arch.png]]></FileName>"
+                f"<ImageBase64><![CDATA[{png_b64}]]></ImageBase64>"
+                "<Caption><![CDATA[explain architecture diagram]]></Caption></xml>"
+            )
+            r_xml = client.post(
+                "/wechat/webhook",
+                content=xml_img,
+                headers={"X-WeChat-Token": "wh_tok_asset"},
+            )
+            assert r_xml.status_code == 200
+            xml_reply = r_xml.json()["reply"]
+            assert "arch.png" in xml_reply and "ANALYZED:explain architecture diagram" in xml_reply
+            assert (ws / ".wechat_assets" / "arch.png").read_bytes() == png_bytes
+
+            r_json = client.post(
+                "/wechat/webhook",
+                json={
+                    "from_user": "wx_asset",
+                    "msg_id": "wh_file_1",
+                    "msg_type": "file",
+                    "file_name": "fix.diff",
+                    "content": "+return True\n",
+                    "caption": "apply patch",
+                },
+                headers={"X-WeChat-Token": "wh_tok_asset"},
+            )
+            assert r_json.status_code == 200
+            json_reply = r_json.json()["reply"]
+            assert "fix.diff" in json_reply and "ANALYZED:apply patch" in json_reply
+            assert (ws / ".wechat_assets" / "fix.diff").read_text(encoding="utf-8") == "+return True\n"
+
+            # 3. Verify GET /audit/engines authentication & export
+            assert client.get("/audit/engines").status_code == 403
+            r_audit = client.get(
+                "/audit/engines?engine=agy&user_id=wx_asset&export_file=true",
+                headers={"X-WeChat-Token": "wh_tok_asset"},
+            )
+            assert r_audit.status_code == 200
+            audit_payload = r_audit.json()
+            assert audit_payload["status"] == "exported"
+            assert Path(audit_payload["export_path"]).is_file()
+            assert audit_payload["audit"]["engine_summaries"]["agy"]["total_calls"] == 3
     finally:
         store.close()

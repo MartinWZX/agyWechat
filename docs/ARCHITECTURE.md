@@ -15,15 +15,16 @@
   ▼
 [1. 接入网关层] gateway/wechat_gateway.py, ilink_gateway.py, terminal_cleaner.py, main.py
   ├─ 鉴权与 MsgId 幂等去重
-  ├─ 模态边界预检（抽取微信原生 XML <Recognition> 或 iLink voice_item 文本；兼容 <?xml 声明头；严禁伪造兜底）
-  └─ ANSICleaner 输出清洗（含连续进度行去重）+ WeChatSplitter 代码块保护分段推送（覆盖 iLink 与 Webhook 推送）
+  ├─ 模态边界预检（抽取微信原生 XML <Recognition> 或 iLink voice_item 文本；兼容 <?xml 声明头；支持图片/文件片段安全落盘至工作区 `.wechat_assets/`）
+  └─ ANSICleaner 输出清洗（含连续进度行去重）+ WeChatSplitter 代码块保护分段推送（覆盖 iLink 与 Webhook 推送）+ 流式中间态进度摘要推送
   │
   ▼
 [2. 两态分离状态机] router/pipeline.py (DeterministicRouter)
   ├─ 第一态【非引擎态 / 网关路由态】(active_engine == "")
   │    ├─ msg_type == "voice" -> 直接拦截并提示切换文字命令或先进入引擎
   │    └─ 纯文本命令路由 (EngineSessionRouter & WorkspaceNavigator):
-  │         /help, /status, /engines, /pwd, /workspace <path>, /ls [subpath], /agy, /pi, /claude, /omp
+  │         /help, /status, /engines, /export [engine], /engines audit [engine], /pwd, /workspace <path>, /ls [subpath], /agy, /pi, /claude, /omp
+  │         支持 USER_WORKSPACES 多用户独立默认工作区映射与并发隔离
   │
   └─ 第二态【引擎态 / 原生智能体自治态】(active_engine in {"agy", "pi", "claude", "omp"})
        ├─ 放行微信原生语音识别结果 Recognition 原样透传（为空则直接拒绝并返回提示）

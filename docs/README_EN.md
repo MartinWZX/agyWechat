@@ -55,10 +55,10 @@ agyWechat/
 
 1. **State 1 — Non-Engine Router State (`active_engine == ""`)**:
    - **Voice Strictly Forbidden**: Inbound WeChat voice messages (`msg_type == "voice"`) are rejected immediately with text instructions.
-   - **Text Management Commands Only**: `/help`, `/status` (live host CPU/RAM/disk/uptime + installed engines), `/engines` (install status/version, binary path & session state), `/pwd`, `/workspace <path>`, `/ls [subpath]`, `/agy`, `/pi`, `/claude`, `/omp` (instant `is_installed()` check only—zero crawlers, zero PTY probes, zero wind-control gates).
+   - **Text Management Commands & Asset Drop-off**: `/help`, `/status` (live host CPU/RAM/disk/uptime + installed engines), `/engines` (install status/version, binary path & session state), `/export [engine]` / `/engines audit [engine]` (per-engine command audit JSON export), `/pwd`, `/workspace <path>`, `/ls [subpath]`, `/agy`, `/pi`, `/claude`, `/omp` (instant `is_installed()` check only), plus per-user isolated default workspaces (`USER_WORKSPACES`) and automatic `.wechat_assets/` persistence for inbound images/files.
 2. **State 2 — In-Engine Native Autonomous State (`active_engine in {"agy", "pi", "claude", "omp"}`)**:
    - **Only 3 Gateway Control Commands**: `/exit` (return to Non-Engine state), `/clear` (reset gateway-tracked `conversation_id` for a fresh thread), and `/help` (show active engine, version, bound workspace, and control hints).
-   - **100% Native Passthrough for Everything Else**: Every other text message, slash command, or verbatim WeChat native `Recognition` transcript (aborting cleanly without fallback text if empty) passes untouched to `asyncio.create_subprocess_exec(..., env=os.environ.copy())`, returning ANSI-cleaned stdout/stderr verbatim.
+   - **100% Native Passthrough + Streaming Progress**: Every other text message, slash command, verbatim WeChat native `Recognition` transcript, or captioned image/file attachment passes directly to `asyncio.create_subprocess_exec(..., env=os.environ.copy(), start_new_session=True)`, optionally emitting periodic stage progress summaries (`PROGRESS_PUSH_INTERVAL_SECONDS`) and returning ANSI-cleaned stdout/stderr verbatim.
 
 ---
 

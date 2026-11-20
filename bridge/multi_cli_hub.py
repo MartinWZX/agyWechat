@@ -1,6 +1,6 @@
 """Pure Multi-CLI Hub for Direct Passthrough to Four Native AI Engines (`agy`, `pi`, `claude`, `omp`)."""
 import asyncio
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from config import get_engine_binary, resolve_workspace_root
 from gateway.terminal_cleaner import ANSICleaner
@@ -79,10 +79,23 @@ class MultiCLIHub:
         prompt: str,
         workspace_dir: str,
         cli_flags: Optional[List[str]] = None,
+        progress_callback: Optional[Callable[[str], Awaitable[Any]]] = None,
+        progress_interval: float = 0.0,
     ) -> Tuple[int, str, str]:
         if cli_flags:
-            return await driver.execute_with_flags(prompt, workspace_dir, extra_flags=cli_flags)
-        return await driver.execute_one_liner(prompt, workspace_dir)
+            return await driver.execute_with_flags(
+                prompt,
+                workspace_dir,
+                extra_flags=cli_flags,
+                progress_callback=progress_callback,
+                progress_interval=progress_interval,
+            )
+        return await driver.execute_one_liner(
+            prompt,
+            workspace_dir,
+            progress_callback=progress_callback,
+            progress_interval=progress_interval,
+        )
 
     async def execute_task(
         self,
@@ -91,6 +104,8 @@ class MultiCLIHub:
         cli_flags: Optional[List[str]] = None,
         workspace_dir: Optional[str] = None,
         session_meta_out: Optional[Dict[str, Any]] = None,
+        progress_callback: Optional[Callable[[str], Awaitable[Any]]] = None,
+        progress_interval: float = 0.0,
         **_ignored: Any,
     ) -> Tuple[bool, str, str]:
         """Route prompt directly to the target native CLI engine and return cleaned verbatim output/errors."""
@@ -101,7 +116,12 @@ class MultiCLIHub:
         driver = self.drivers[target_engine]
         target_ws = workspace_dir or self.workspace_dir
         returncode, raw_stdout, stderr = await self._run_driver_once(
-            driver, prompt, target_ws, cli_flags=cli_flags
+            driver,
+            prompt,
+            target_ws,
+            cli_flags=cli_flags,
+            progress_callback=progress_callback,
+            progress_interval=progress_interval,
         )
 
         stdout_text, detected_conv_id = extract_engine_json_result(raw_stdout)

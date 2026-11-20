@@ -1,4 +1,5 @@
 """Tests for Pure Two-State Engine FSM, Instant Entry, Host Env Passthrough, and Native Conversations."""
+import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import json
 import os
@@ -364,5 +365,102 @@ def test_workspace_navigator_blocks_gcloud_and_concurrent_session_updates(tmp_pa
         state = repo.get_session_state("u_conc")
         assert state["meta"]["turn_count"] == 16
         assert state["meta"]["conversation_id"] == "conv_0"
+    finally:
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_multi_user_concurrent_workspaces_and_per_engine_audit_export(tmp_path: Path):
+    """Verify USER_WORKSPACES isolation across concurrent users and /export per-engine command audit."""
+    ws_alpha = tmp_path / "ws_alpha"
+    ws_beta = tmp_path / "ws_beta"
+    ws_default = tmp_path / "ws_default"
+    for d in (ws_alpha, ws_beta, ws_default):
+        d.mkdir(parents=True)
+
+    agy_bin = tmp_path / "mock_user_agy.py"
+    pi_bin = tmp_path / "mock_user_pi.py"
+    _write_exec(
+        agy_bin,
+        "import json, os, sys\n"
+        "args = sys.argv[1:]\n"
+        "if '--version' in args: print('agy 1.7.0'); sys.exit(0)\n"
+        "p = args[args.index('-p') + 1] if '-p' in args else ''\n"
+        "with open('alpha_work.txt', 'w', encoding='utf-8') as f: f.write(p)\n"
+        "print(json.dumps({'conversation_id': 'c_alpha', 'response': f'ALPHA_DIR={os.getcwd()}'}))\n",
+    )
+    _write_exec(
+        pi_bin,
+        "import os, sys\n"
+        "args = sys.argv[1:]\n"
+        "if '--version' in args: print('pi 3.2.0'); sys.exit(0)\n"
+        "p = args[args.index('-p') + 1] if '-p' in args else ''\n"
+        "with open('beta_work.txt', 'w', encoding='utf-8') as f: f.write(p)\n"
+        "print(f'BETA_DIR={os.getcwd()}')\n",
+    )
+
+    cfg = {
+        "system": {"workspace_dir": str(ws_default)},
+        "engines": {
+            "primary": "agy",
+            "agy": {"binary": str(agy_bin), "dangerously_skip_permissions_flag": ""},
+            "pi": {"binary": str(pi_bin), "dangerously_skip_permissions_flag": ""},
+        },
+    }
+    s = Settings(
+        _env_file=None,
+        WORKSPACE_ROOT=ws_default,
+        DB_PATH=tmp_path / "multi_user.db",
+        USER_WORKSPACES={"u_alpha": str(ws_alpha), "u_beta": str(ws_beta)},
+        AGY_BINARY=str(agy_bin),
+        PI_BINARY=str(pi_bin),
+    )
+    store = CoreStateStore(s.DB_PATH)
+    hub = MultiCLIHub(config=cfg, store=store, settings=s)
+    gw = WeChatGateway(config=cfg, hub=hub, store=store, settings=s)
+
+    try:
+        pwd_a, pwd_b = await asyncio.gather(
+            gw.process_inbound_message("u_alpha", "/pwd"),
+            gw.process_inbound_message("u_beta", "/pwd"),
+        )
+        assert str(ws_alpha.resolve()) in pwd_a and "用户专属默认工作区" in pwd_a
+        assert str(ws_beta.resolve()) in pwd_b and "用户专属默认工作区" in pwd_b
+
+        enter_a, enter_b = await asyncio.gather(
+            gw.process_inbound_message("u_alpha", "/agy"),
+            gw.process_inbound_message("u_beta", "/pi"),
+        )
+        assert "已进入 [AGY]" in enter_a and str(ws_alpha.resolve()) in enter_a
+        assert "已进入 [PI]" in enter_b and str(ws_beta.resolve()) in enter_b
+
+        res_a1, res_b1 = await asyncio.gather(
+            gw.process_inbound_message("u_alpha", "/plan check alpha"),
+            gw.process_inbound_message("u_beta", "build beta module"),
+        )
+        assert f"ALPHA_DIR={ws_alpha.resolve()}" in res_a1
+        assert f"BETA_DIR={ws_beta.resolve()}" in res_b1
+        assert (ws_alpha / "alpha_work.txt").is_file() and not (ws_alpha / "beta_work.txt").exists()
+        assert (ws_beta / "beta_work.txt").is_file() and not (ws_beta / "alpha_work.txt").exists()
+
+        await asyncio.gather(
+            gw.process_inbound_message("u_alpha", "/exit"),
+            gw.process_inbound_message("u_beta", "/exit"),
+        )
+
+        export_agy = await gw.process_inbound_message("u_alpha", "/export agy")
+        assert "每引擎指令审计报告 · AGY" in export_agy
+        assert "/agy: 总调用 3 次" in export_agy
+        audit_agy_file = ws_alpha / ".wechat_audit" / "engine_audit_agy.json"
+        assert audit_agy_file.is_file()
+        audit_agy_json = json.loads(audit_agy_file.read_text(encoding="utf-8"))
+        assert audit_agy_json["engine_summaries"]["agy"]["total_calls"] == 3
+        assert audit_agy_json["engine_summaries"]["agy"]["slash_calls"] == 3
+        assert any(r["command"] == "/plan check alpha" for r in audit_agy_json["records"])
+
+        export_all = await gw.process_inbound_message("u_beta", "/engines audit")
+        assert "每引擎指令审计报告 · ALL" in export_all
+        assert "/pi: 总调用 3 次" in export_all
+        assert (ws_beta / ".wechat_audit" / "engine_audit_all.json").is_file()
     finally:
         store.close()

@@ -10,7 +10,7 @@ import logging
 import os
 import time
 import xml.etree.ElementTree as ET
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
@@ -199,6 +199,34 @@ async def health():
     }
 
 
+@app.get("/audit/engines")
+async def audit_engines(
+    request: Request,
+    engine: Optional[str] = None,
+    user_id: Optional[str] = None,
+    limit: int = 100,
+    export_file: bool = False,
+):
+    """Export fine-grained per-engine command audit summary and execution records."""
+    verify_webhook_auth(request, settings)
+    norm_engine = (engine or "").strip().lower() or None
+    if norm_engine and norm_engine not in ("agy", "pi", "claude", "omp"):
+        raise HTTPException(status_code=400, detail="Unsupported engine; choose from agy, pi, claude, omp.")
+    clamped_limit = max(1, min(int(limit), 1000))
+    if export_file:
+        ws = gateway.det_router.engine_router.workspace_nav.get_workspace(user_id or "default")
+        out_path, data = await asyncio.to_thread(
+            store.export_engine_audit_to_file,
+            ws,
+            norm_engine,
+            user_id,
+            clamped_limit,
+        )
+        return {"status": "exported", "export_path": str(out_path), "audit": data}
+    data = await asyncio.to_thread(store.export_engine_audit, norm_engine, user_id, clamped_limit)
+    return {"status": "ok", "audit": data}
+
+
 @app.get("/wechat/webhook")
 async def wechat_webhook_handshake(request: Request):
     """Standard WeChat Official Account / Enterprise WeChat GET echostr verification."""
@@ -226,6 +254,7 @@ async def wechat_webhook(request: Request):
     content = ""
     msg_type = "text"
     msg_id = f"msg_{int(time.time() * 1000)}_{os.urandom(2).hex()}"
+    media_meta: Optional[Dict[str, Any]] = None
 
     if "json" in content_type.lower():
         try:
@@ -233,7 +262,28 @@ async def wechat_webhook(request: Request):
             from_user = str(data.get("from_user", "unknown_user"))
             content = str(data.get("content", ""))
             msg_id = str(data.get("msg_id", msg_id))
-            msg_type = str(data.get("msg_type", "text"))
+            msg_type = str(data.get("msg_type", "text")).strip().lower()
+            if msg_type in ("image", "file", "attachment") or any(
+                k in data for k in ("base64", "file_name", "filename", "pic_url", "file_url", "media_url")
+            ):
+                media_meta = {
+                    k: data[k]
+                    for k in (
+                        "file_name",
+                        "filename",
+                        "name",
+                        "base64",
+                        "data",
+                        "content",
+                        "url",
+                        "pic_url",
+                        "file_url",
+                        "media_url",
+                        "caption",
+                        "prompt",
+                    )
+                    if k in data
+                }
         except ValueError:
             content = body_str
     elif _is_xml_payload(body_str):
@@ -264,10 +314,20 @@ async def wechat_webhook(request: Request):
     if _is_duplicate_msg(msg_id):
         return JSONResponse({"status": "success", "reply": ""})
 
+    has_real_push = bool(settings.WECHAT_PUSH_URL and "127.0.0.1:8000/mock/" not in settings.WECHAT_PUSH_URL)
+    progress_cb = (lambda text: _post_webhook_push(from_user, text)) if has_real_push else None
+
     reply = ""
-    if content or msg_type == "voice":
-        reply = await gateway.handle_message(msg_id, from_user, msg_type, content)
-        if reply and settings.WECHAT_PUSH_URL and "127.0.0.1:8000/mock/" not in settings.WECHAT_PUSH_URL:
+    if content or msg_type in ("voice", "image", "file", "attachment") or media_meta is not None:
+        reply = await gateway.handle_message(
+            msg_id,
+            from_user,
+            msg_type,
+            content,
+            progress_callback=progress_cb,
+            media_meta=media_meta,
+        )
+        if reply and has_real_push:
             await _post_webhook_push(from_user, reply)
 
     return JSONResponse({"status": "success", "reply": reply})
